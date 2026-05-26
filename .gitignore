@@ -1,4 +1,5 @@
-script/__pycache__
+__pycache__/
+*.pyc
 test
 workspace
 temp2.cfg
