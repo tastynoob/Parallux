@@ -81,6 +81,15 @@ for case in ["a", "b", "c"]:
 
 Each scheduled task is executed through `script/runner.py`. The runner reloads the same configuration file, registers tasks, resolves the requested task id, and executes that task. In runner mode, `goal.issue()` is a no-op and does not recursively schedule work.
 
+Inside a running task, `runner.work_relpath` is the task's path relative to `root_path`, and `runner.work_dir` is the absolute working directory.
+`runner.run()` uses `runner.work_dir` as its default current working directory; pass `cwd=...` to override it for a single command.
+
+By default, task work directories are placed under `root_path/parallax-<run-id>/`. A task can override the relative path:
+
+```python
+goal.addTask(task_hello, work_relpath="suite-a/case-001")
+```
+
 ## Runners
 
 Local runner:
@@ -139,20 +148,20 @@ goal.addTask(build_print_task("hello", "from helper"))
 
 ## Logs
 
-Logs are written under `root_path/parallax-<run-id>/`:
+Logs are written under each task's work directory:
 
 ```text
-parallax-<run-id>/
-  task_id-runner/
-    command.txt
-    stdout.log
-    stderr.log
-  failures.txt
+<work-path>/
+  command.txt
+  stdout.log
+  stderr.log
 ```
+
+Run-level `failures.txt` is written under `root_path/parallax-<run-id>/`.
 
 ## Files
 
 - `parallax.py`: typed configuration shell for `from parallax import goal, runner`
-- `script/controller.py`: controller entrypoint
-- `script/runner.py`: single-task runner entrypoint
-- `script/_core.py`: internal implementation
+- `script/controller.py`: controller CLI and task scheduler
+- `script/runner.py`: single-task runner CLI, command runtime, and NUMA allocator
+- `script/_core.py`: shared config model and config loader

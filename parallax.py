@@ -68,6 +68,7 @@ class GoalShell(Protocol):
         num_cores: int = 0,
         numa_node: int | None = None,
         env: Mapping[str, str] | None = None,
+        work_relpath: str | None = None,
     ) -> None: ...
 
     @overload
@@ -81,6 +82,7 @@ class GoalShell(Protocol):
         num_cores: int = 0,
         numa_node: int | None = None,
         env: Mapping[str, str] | None = None,
+        work_relpath: str | None = None,
     ) -> Callable[[F], F]: ...
 
     def task(self, func: F | None = None, **kwargs: Any) -> F | Callable[[F], F]: ...
@@ -90,6 +92,8 @@ class GoalShell(Protocol):
 
 class RunnerShell(Protocol):
     name: str
+    work_relpath: str
+    work_dir: str
     env: dict[str, str]
 
     def run(
@@ -102,6 +106,7 @@ class RunnerShell(Protocol):
         check: bool = True,
         timeout: float | None = None,
         env: Mapping[str, str] | None = None,
+        cwd: str | None = None,
     ) -> int: ...
 
 

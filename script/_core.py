@@ -1,17 +1,8 @@
 from __future__ import annotations
 
-import argparse
-import fcntl
-import inspect
-import json
-import os
 import re
 import shlex
-import subprocess
 import sys
-import threading
-import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -40,20 +31,11 @@ def _shell_join(argv: Sequence[Any]) -> str:
     return " ".join(shlex.quote(str(arg)) for arg in argv)
 
 
-def _format_cores(cores: Sequence[int]) -> str:
-    values = sorted(set(int(core) for core in cores))
-    if not values:
-        return ""
-    ranges: list[str] = []
-    start = prev = values[0]
-    for core in values[1:]:
-        if core == prev + 1:
-            prev = core
-            continue
-        ranges.append(str(start) if start == prev else f"{start}-{prev}")
-        start = prev = core
-    ranges.append(str(start) if start == prev else f"{start}-{prev}")
-    return ",".join(ranges)
+def _validate_relative_path(value: str, *, label: str) -> str:
+    path = Path(value)
+    if not value or path.is_absolute() or ".." in path.parts:
+        raise ParallaxError(f"{label} must be a relative path under root_path")
+    return path.as_posix()
 
 
 @dataclass
@@ -112,6 +94,7 @@ class TaskSpec:
     num_cores: int = 0
     numa_node: int | None = None
     env: dict[str, str] = field(default_factory=dict)
+    work_relpath: str | None = None
 
 
 @dataclass
@@ -123,9 +106,16 @@ class ControllerOptions:
 
 
 class Goal:
-    def __init__(self, *, mode: str, options: ControllerOptions | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        mode: str,
+        options: ControllerOptions | None = None,
+        scheduler_factory: Callable[[Any, ControllerOptions, str], Any] | None = None,
+    ) -> None:
         self.mode = mode
         self.options = options
+        self.scheduler_factory = scheduler_factory
         self.tasks: list[TaskSpec] = []
         self.runners: list[RunnerSpec] = [self.local("local")]
         self.env: dict[str, str] = {}
@@ -225,6 +215,7 @@ class Goal:
         num_cores: int = 0,
         numa_node: int | None = None,
         env: Mapping[str, str] | None = None,
+        work_relpath: str | None = None,
     ) -> None:
         if isinstance(task, Sequence) and not callable(task):
             for item in task:
@@ -234,12 +225,18 @@ class Goal:
                     num_cores=num_cores,
                     numa_node=numa_node,
                     env=env,
+                    work_relpath=work_relpath,
                 )
             return
         if not callable(task):
             raise ParallaxError(f"goal.addTask() expects a callable task, got {task!r}")
         if num_cores < 0:
             raise ParallaxError("task num_cores must be >= 0")
+        normalized_work_relpath = (
+            _validate_relative_path(work_relpath, label="task work_relpath")
+            if work_relpath is not None
+            else None
+        )
         base_name = _sanitize(name or getattr(task, "__name__", "task"))
         task_id = self._next_task_id(base_name)
         self.tasks.append(
@@ -251,6 +248,7 @@ class Goal:
                 num_cores=int(num_cores),
                 numa_node=numa_node,
                 env={str(k): str(v) for k, v in dict(env or {}).items()},
+                work_relpath=normalized_work_relpath,
             )
         )
 
@@ -270,8 +268,11 @@ class Goal:
             raise ParallaxError("goal.issue() can only be called once")
         if self.options is None:
             raise ParallaxError("controller options are missing")
+        if self.scheduler_factory is None:
+            raise ParallaxError("controller scheduler is missing")
+
         self.issued = True
-        Scheduler(self, self.options, root_path).run()
+        self.scheduler_factory(self, self.options, root_path).run()
 
     def _next_task_id(self, base_name: str) -> str:
         count = self._name_counts.get(base_name, 0) + 1
@@ -293,330 +294,6 @@ class Goal:
                 f"task name {task_id_or_name!r} is ambiguous; use one of: {choices}"
             )
         raise ParallaxError(f"unknown task: {task_id_or_name!r}")
-
-
-class Scheduler:
-    def __init__(self, goal: Goal, options: ControllerOptions, root_path: str) -> None:
-        self.goal = goal
-        self.options = options
-        self.root_path = Path(root_path)
-        self.run_id = options.run_id or self._make_run_id()
-        self.run_dir = self.root_path / f"parallax-{self.run_id}"
-        self.script_dir = Path(__file__).resolve().parent
-        self.semaphores = {
-            runner.name: threading.Semaphore(runner.max_jobs or goal.parallel)
-            for runner in self.goal.runners
-        }
-
-    def run(self) -> None:
-        if not self.goal.tasks:
-            raise ParallaxError("no task registered; use goal.addTask() first")
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        failures: list[tuple[TaskSpec, RunnerSpec, int]] = []
-
-        runner_index = 0
-        futures = set()
-        task_iter = iter(self.goal.tasks)
-        with ThreadPoolExecutor(max_workers=self.goal.parallel) as executor:
-            def choose_runner() -> RunnerSpec:
-                nonlocal runner_index
-                runner = self.goal.runners[runner_index % len(self.goal.runners)]
-                runner_index += 1
-                return runner
-
-            def submit_next() -> bool:
-                try:
-                    task = next(task_iter)
-                except StopIteration:
-                    return False
-                runner = choose_runner()
-                futures.add(executor.submit(self._run_one, task, runner))
-                return True
-
-            for _ in range(self.goal.parallel):
-                if not submit_next():
-                    break
-
-            while futures:
-                done, futures = wait(futures, return_when=FIRST_COMPLETED)
-                for future in done:
-                    task, runner, returncode = future.result()
-                    if returncode != 0:
-                        failures.append((task, runner, returncode))
-                while len(futures) < self.goal.parallel:
-                    if not submit_next():
-                        break
-
-        if failures:
-            failure_path = self.run_dir / "failures.txt"
-            with failure_path.open("w", encoding="utf-8") as fs:
-                for task, runner, returncode in failures:
-                    fs.write(f"{task.id} runner={runner.name} returncode={returncode}\n")
-            raise ParallaxError(f"{len(failures)} task(s) failed; see {failure_path}")
-        print(f"all tasks finished; logs: {self.run_dir}")
-
-    def _run_one(self, task: TaskSpec, runner: RunnerSpec) -> tuple[TaskSpec, RunnerSpec, int]:
-        task_dir = self.run_dir / _sanitize(f"{task.id}-{runner.name}")
-        task_dir.mkdir(parents=True, exist_ok=True)
-        stdout_path = task_dir / "stdout.log"
-        stderr_path = task_dir / "stderr.log"
-        argv = self._runner_command(task, runner)
-        with (task_dir / "command.txt").open("w", encoding="utf-8") as fs:
-            fs.write(_shell_join(argv))
-            fs.write("\n")
-        with self.semaphores[runner.name]:
-            with stdout_path.open("w", encoding="utf-8") as stdout, stderr_path.open(
-                "w", encoding="utf-8"
-            ) as stderr:
-                if self.options.dry_run:
-                    stdout.write("[dry-run]\n")
-                    stdout.write(_shell_join(argv))
-                    stdout.write("\n")
-                    return task, runner, 0
-                completed = subprocess.run(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout,
-                    stderr=stderr,
-                    text=True,
-                    check=False,
-                )
-                return task, runner, completed.returncode
-
-    def _runner_command(self, task: TaskSpec, runner: RunnerSpec) -> list[str]:
-        runner_script = self.script_dir / "runner.py"
-        common = [
-            "--runner",
-            runner.name,
-            "--root-path",
-            str(self.root_path),
-            "--run-id",
-            self.run_id,
-        ]
-        tail = ["--", task.id]
-        if runner.kind == "local":
-            config_path = str(self.options.config_path)
-            return [sys.executable, str(runner_script), *common, config_path, *tail]
-
-        remote_config = self.options.config_arg
-        remote_cmd = _shell_join([runner.python, "script/runner.py", *common, remote_config, *tail])
-        if runner.workdir:
-            remote_cmd = f"cd {shlex.quote(runner.workdir)} && {remote_cmd}"
-        argv = ["ssh", *runner.ssh_options, "-p", str(runner.port), runner.target]
-        argv.extend([runner.shell, "-lc", shlex.quote(remote_cmd)])
-        return argv
-
-    @staticmethod
-    def _make_run_id() -> str:
-        now = time.time()
-        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
-        return f"{stamp}-{int((now % 1) * 1000):03d}-{os.getpid()}"
-
-
-class CoreLease:
-    def __init__(self, allocator: "CoreAllocator", cores: list[int], mem_node: int | None) -> None:
-        self.allocator = allocator
-        self.cores = cores
-        self.mem_node = mem_node
-
-    def __enter__(self) -> "CoreLease":
-        return self
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        self.allocator.release(self.cores)
-
-    def wrap(self, command: str, shell: str) -> str:
-        if not self.cores:
-            return command
-        args = ["numactl"]
-        if self.mem_node is not None:
-            args.extend(["-m", str(self.mem_node)])
-        args.extend(["-C", _format_cores(self.cores), shell, "-lc", command])
-        return _shell_join(args)
-
-
-class CoreAllocator:
-    def __init__(self, spec: RunnerSpec, root_path: str, runner_name: str) -> None:
-        self.spec = spec
-        lock_dir = Path(root_path) / ".parallax-locks"
-        lock_dir.mkdir(parents=True, exist_ok=True)
-        self.lock_path = lock_dir / f"{_sanitize(runner_name)}.lock"
-        self.state_path = lock_dir / f"{_sanitize(runner_name)}.json"
-
-    def acquire(
-        self,
-        *,
-        num_cores: int = 0,
-        numa_node: int | None = None,
-        cores: Sequence[int] | None = None,
-    ) -> CoreLease:
-        if cores:
-            requested = [int(core) for core in cores]
-        elif num_cores > 0:
-            requested = self._allocate_count(num_cores, numa_node)
-        else:
-            requested = []
-        mem_node = numa_node if numa_node is not None else self._infer_node(requested)
-        return CoreLease(self, requested, mem_node)
-
-    def release(self, cores: Sequence[int]) -> None:
-        if not cores:
-            return
-        with self._locked_state() as state:
-            available = set(state["available"])
-            available.update(int(core) for core in cores)
-            state["available"] = sorted(available & set(state["pool"]))
-
-    def _allocate_count(self, count: int, numa_node: int | None) -> list[int]:
-        if count <= 0:
-            return []
-        pool = self._candidate_pool(numa_node)
-        if not pool:
-            raise ParallaxError(
-                f"runner {self.spec.name!r} needs core_pool/numa_nodes for NUMA allocation"
-            )
-        while True:
-            with self._locked_state() as state:
-                available = [core for core in pool if core in set(state["available"])]
-                if len(available) >= count:
-                    allocated = available[:count]
-                    state["available"] = [
-                        core for core in state["available"] if core not in set(allocated)
-                    ]
-                    return allocated
-            time.sleep(1)
-
-    def _candidate_pool(self, numa_node: int | None) -> list[int]:
-        if numa_node is not None and self.spec.numa_nodes:
-            return list(self.spec.numa_nodes.get(numa_node, []))
-        return list(self.spec.core_pool)
-
-    def _infer_node(self, cores: Sequence[int]) -> int | None:
-        if not cores or not self.spec.numa_nodes:
-            return None
-        core_set = set(cores)
-        for node, node_cores in self.spec.numa_nodes.items():
-            if core_set.issubset(set(node_cores)):
-                return node
-        return None
-
-    def _configured_pool(self) -> list[int]:
-        cores = sorted(set(self.spec.core_pool))
-        if not cores and self.spec.numa_nodes:
-            merged: set[int] = set()
-            for node_cores in self.spec.numa_nodes.values():
-                merged.update(node_cores)
-            cores = sorted(merged)
-        return cores
-
-    def _initial_state(self) -> dict[str, list[int]]:
-        cores = self._configured_pool()
-        return {"pool": cores, "available": cores}
-
-    def _normalize_state(self, state: dict[str, list[int]]) -> dict[str, list[int]]:
-        pool = self._configured_pool()
-        if state.get("pool") != pool:
-            return {"pool": pool, "available": pool}
-        available = sorted(set(state.get("available", [])) & set(pool))
-        return {"pool": pool, "available": available}
-
-    def _locked_state(self) -> Any:
-        allocator = self
-
-        class LockedState:
-            def __enter__(self) -> dict[str, list[int]]:
-                self.lock_file = allocator.lock_path.open("w", encoding="utf-8")
-                fcntl.flock(self.lock_file, fcntl.LOCK_EX)
-                if allocator.state_path.exists():
-                    with allocator.state_path.open("r", encoding="utf-8") as fs:
-                        self.state = allocator._normalize_state(json.load(fs))
-                else:
-                    self.state = allocator._initial_state()
-                return self.state
-
-            def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-                with allocator.state_path.open("w", encoding="utf-8") as fs:
-                    json.dump(self.state, fs)
-                fcntl.flock(self.lock_file, fcntl.LOCK_UN)
-                self.lock_file.close()
-
-        return LockedState()
-
-
-class RuntimeRunner:
-    def __init__(
-        self,
-        *,
-        goal: Goal,
-        runner_name: str,
-        root_path: str,
-        dry_run: bool = False,
-    ) -> None:
-        self.goal = goal
-        self.name = runner_name
-        self.root_path = root_path
-        self.dry_run = dry_run
-        self.current_task: TaskSpec | None = None
-        self.spec = goal.local("local")
-        self.allocator = CoreAllocator(self.spec, root_path, runner_name)
-
-    @property
-    def env(self) -> dict[str, str]:
-        merged = dict(self.goal.env)
-        merged.update(self.spec.env)
-        if self.current_task:
-            merged.update(self.current_task.env)
-        return merged
-
-    def run(
-        self,
-        command: str,
-        *,
-        num_cores: int | None = None,
-        numa_node: int | None = None,
-        cores: Sequence[int] | None = None,
-        check: bool = True,
-        timeout: float | None = None,
-        env: Mapping[str, str] | None = None,
-    ) -> int:
-        if self.current_task is None:
-            raise ParallaxError("runner.run() can only be used while a task is executing")
-        use_cores = self.current_task.num_cores if num_cores is None else num_cores
-        use_node = self.current_task.numa_node if numa_node is None else numa_node
-        command_env = os.environ.copy()
-        command_env.update(self.env)
-        command_env.update({str(k): str(v) for k, v in dict(env or {}).items()})
-        with self.allocator.acquire(num_cores=use_cores or 0, numa_node=use_node, cores=cores) as lease:
-            full_command = lease.wrap(command, self.spec.shell)
-            if self.dry_run:
-                print("[dry-run]", full_command)
-                return 0
-            completed = subprocess.run(
-                [self.spec.shell, "-lc", full_command],
-                cwd=self.spec.workdir,
-                env=command_env,
-                text=True,
-                check=False,
-                timeout=timeout,
-            )
-            if check and completed.returncode != 0:
-                raise ParallaxError(f"command failed with exit code {completed.returncode}: {command}")
-            return completed.returncode
-
-    def _find_runner_spec(self, runner_name: str) -> RunnerSpec:
-        for spec in self.goal.runners:
-            if spec.name == runner_name:
-                return spec
-        if runner_name == "local":
-            return self.goal.local("local")
-        raise ParallaxError(f"runner {runner_name!r} is not configured")
-
-
-class ControllerRunner:
-    name = "controller"
-
-    def run(self, *_args: Any, **_kwargs: Any) -> None:
-        raise ParallaxError("runner.run() is only available inside a task executed by runner.py")
 
 
 def execute_config(path: Path, *, goal: Goal, runner: Any) -> None:
@@ -641,97 +318,3 @@ def execute_config(path: Path, *, goal: Goal, runner: Any) -> None:
     }
     code = compile(path.read_text(encoding="utf-8"), str(path), "exec")
     exec(code, globals_dict)
-
-
-def run_controller(argv: Sequence[str]) -> int:
-    parser = argparse.ArgumentParser(description="run a Parallax Python config")
-    parser.add_argument("config", nargs="?", help="Python config file")
-    parser.add_argument("-f", "--file", help="Python config file")
-    parser.add_argument("--dry-run", action="store_true", help="render runner commands only")
-    parser.add_argument("--list-tasks", action="store_true", help="list registered task ids and exit")
-    parser.add_argument("--run-id", help="override generated run id")
-    parser.add_argument("extra", nargs=argparse.REMAINDER, help=argparse.SUPPRESS)
-    args = parser.parse_args(list(argv))
-
-    config_arg = args.file or args.config
-    if not config_arg:
-        parser.error("missing config file")
-    config_path = Path(config_arg).resolve()
-    if config_path.suffix != ".py":
-        raise ParallaxError("config file must be a .py file")
-    if not config_path.exists():
-        raise ParallaxError(f"config file does not exist: {config_path}")
-
-    extra = _strip_remainder_marker(args.extra)
-    if extra:
-        raise ParallaxError(
-            "task function arguments are not supported; use a task builder to create zero-arg tasks"
-        )
-    mode = "collect" if args.list_tasks else "controller"
-    options = ControllerOptions(
-        config_path=config_path,
-        config_arg=config_arg,
-        dry_run=args.dry_run,
-        run_id=args.run_id,
-    )
-    goal = Goal(mode=mode, options=options)
-    execute_config(config_path, goal=goal, runner=ControllerRunner())
-
-    if args.list_tasks:
-        for task in goal.tasks:
-            print(task.id)
-        return 0
-
-    if not goal.issued:
-        goal.issue()
-    return 0
-
-
-def run_worker(argv: Sequence[str]) -> int:
-    parser = argparse.ArgumentParser(description="execute one Parallax task")
-    parser.add_argument("--runner", default="local", help="runner name")
-    parser.add_argument("--root-path", default="workspace/log_root", help="root path for locks")
-    parser.add_argument("--run-id", default="manual", help="run id")
-    parser.add_argument("--dry-run", action="store_true", help="render commands only")
-    parser.add_argument("config", help="Python config file")
-    parser.add_argument("task_tail", nargs=argparse.REMAINDER, help="-- task_id key=value...")
-    args = parser.parse_args(list(argv))
-
-    tail = _strip_remainder_marker(args.task_tail)
-    if not tail:
-        raise ParallaxError("missing task id")
-    task_id = tail[0]
-    if tail[1:]:
-        raise ParallaxError(
-            "task function arguments are not supported; use a task builder to create zero-arg tasks"
-        )
-    config_path = Path(args.config).resolve()
-
-    goal = Goal(mode="worker")
-    runtime_runner = RuntimeRunner(
-        goal=goal,
-        runner_name=args.runner,
-        root_path=args.root_path,
-        dry_run=args.dry_run,
-    )
-    execute_config(config_path, goal=goal, runner=runtime_runner)
-    runtime_runner.spec = runtime_runner._find_runner_spec(args.runner)
-    runtime_runner.allocator = CoreAllocator(runtime_runner.spec, args.root_path, args.runner)
-
-    task = goal.find_task(task_id)
-    runtime_runner.current_task = task
-    os.environ.update(goal.env)
-    os.environ.update(runtime_runner.spec.env)
-    os.environ.update(task.env)
-    invoke_task(task.func)
-    return 0
-
-
-def invoke_task(func: TaskFunc) -> Any:
-    signature = inspect.signature(func)
-    if signature.parameters:
-        raise ParallaxError(
-            f"task {func.__name__!r} must not declare parameters; "
-            "use a task builder/closure to capture values"
-        )
-    return func()
