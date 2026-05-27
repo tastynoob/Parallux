@@ -3,14 +3,14 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "parallax"
+name = "parallux"
 version = "0.1.0"
 description = "Python-controlled command submission runtime for local and SSH runners"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-    { name = "Parallax contributors" },
+    { name = "Parallux contributors" },
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -18,7 +18,7 @@ classifiers = [
 ]
 
 [project.scripts]
-parallax = "parallax:main"
+parallux = "parallux:main"
 
 [tool.setuptools]
-packages = ["parallax"]
+packages = ["parallux"]

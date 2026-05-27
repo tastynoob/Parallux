@@ -1,6 +1,6 @@
-#!/usr/bin/env parallax
+#!/usr/bin/env parallux
 
-from parallax import goal
+from parallux import goal
 
 
 goal.setRunner("local")
@@ -14,7 +14,7 @@ goal.schd("echo user=$USER", name="user", work_relpath="user")
 
 for case in ["a", "b", "c", "d"]:
     goal.schd(
-        f"echo case={case} runner=$PARALLAX_RUNNER",
+        f"echo case={case} runner=$PARALLUX_RUNNER",
         name=f"case_{case}",
         work_relpath=f"case/{case}",
     )

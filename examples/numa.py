@@ -1,6 +1,6 @@
-#!/usr/bin/env parallax
+#!/usr/bin/env parallux
 
-from parallax import goal
+from parallux import goal
 
 
 local = goal.local(

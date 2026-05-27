@@ -1,19 +1,19 @@
-# Parallax
+# Parallux
 
-Parallax 是一个基于 Python 配置文件的命令提交与调度运行时，支持本地执行、SSH 远端执行、全局并行度控制、Runner 级并行度控制以及 NUMA 核心绑定。
+Parallux 是一个基于 Python 配置文件的命令提交与调度运行时，支持本地执行、SSH 远端执行、全局并行度控制、Runner 级并行度控制以及 NUMA 核心绑定。
 
 ## 概述
 
-Parallax 配置文件需要在受控运行时中执行。配置文件通过 `from parallax import goal` 获取运行时对象，并使用 Python 语法描述 Runner、环境变量、命令注册和调度流程。
+Parallux 配置文件需要在受控运行时中执行。配置文件通过 `from parallux import goal` 获取运行时对象，并使用 Python 语法描述 Runner、环境变量、命令注册和调度流程。
 
 ```bash
-parallax config.py -- key=value
+parallux config.py -- key=value
 ```
 
-配置文件可以作为普通 Python 文件编辑，但不应直接通过 `python3 config.py` 执行。Parallax 会在运行前绑定 `goal`，从而确保配置文件始终在受控环境中运行。
+配置文件可以作为普通 Python 文件编辑，但不应直接通过 `python3 config.py` 执行。Parallux 会在运行前绑定 `goal`，从而确保配置文件始终在受控环境中运行。
 
 ```python
-from parallax import goal
+from parallux import goal
 
 
 local_a = goal.local(name="local-a", env={"RUNNER_TAG": "A"}, max_jobs=1)
@@ -24,7 +24,7 @@ goal.setParallel(2)
 
 for index in range(10):
     goal.schd(
-        "echo runner=$PARALLAX_RUNNER tag=$RUNNER_TAG",
+        "echo runner=$PARALLUX_RUNNER tag=$RUNNER_TAG",
         name=f"run_{index}",
     )
 
@@ -39,16 +39,16 @@ goal.issue().sync()
 python3 -m pip install -e .
 ```
 
-安装完成后会提供 `parallax` 命令：
+安装完成后会提供 `parallux` 命令：
 
 ```bash
-parallax --help
+parallux --help
 ```
 
 未安装时，可以在源码目录中使用模块入口：
 
 ```bash
-python3 -m parallax examples/basic.py
+python3 -m parallux examples/basic.py
 ```
 
 ## 运行配置文件
@@ -56,13 +56,13 @@ python3 -m parallax examples/basic.py
 通过命令行运行配置文件：
 
 ```bash
-parallax examples/basic.py
+parallux examples/basic.py
 ```
 
 向配置文件传递参数：
 
 ```bash
-parallax examples/basic.py -- case=hello
+parallux examples/basic.py -- case=hello
 ```
 
 配置文件内可通过以下对象读取参数：
@@ -75,13 +75,13 @@ goal.args
 仅生成执行计划而不实际运行命令：
 
 ```bash
-parallax examples/basic.py --dry-run
+parallux examples/basic.py --dry-run
 ```
 
 配置文件可以声明为可执行文件：
 
 ```python
-#!/usr/bin/env parallax
+#!/usr/bin/env parallux
 ```
 
 添加执行权限后，可以直接运行：
@@ -120,7 +120,7 @@ goal.setRunner([local, server])
 `workspace` 表示 Runner 侧的输出根目录。未显式指定 `workspace` 时，默认使用：
 
 ```text
-~/parallax
+~/parallux
 ```
 
 指定 `work_relpath` 时，每个命令的工作目录为：
@@ -129,7 +129,7 @@ goal.setRunner([local, server])
 <runner.workspace>/<work-relpath>/
 ```
 
-未指定 `work_relpath` 时，Parallax 会使用默认路径：
+未指定 `work_relpath` 时，Parallux 会使用默认路径：
 
 ```text
 <runner.workspace>/<auto-work-relpath>/
@@ -175,14 +175,14 @@ Runner 实例也提供 `run()`，用于立即提交到指定 Runner：
 local.run("echo immediate on local").sync()
 ```
 
-配置文件退出时，如果仍存在已经注册但尚未提交的命令，Parallax 会在结束前自动提交并等待这些命令完成。
+配置文件退出时，如果仍存在已经注册但尚未提交的命令，Parallux 会在结束前自动提交并等待这些命令完成。
 
 ## Handle
 
 `goal.run()` 和 Runner 实例的 `run()` 返回单命令句柄，`goal.issue()` 返回任务组句柄。单命令句柄在命令被调度后会记录分配结果：
 
 ```python
-handle = goal.run("echo runner=$PARALLAX_RUNNER")
+handle = goal.run("echo runner=$PARALLUX_RUNNER")
 
 result = handle.sync()
 print(handle.runner_name)
@@ -238,7 +238,7 @@ all_status = goal.runner_status()
 one_status = goal.runner_status(local)
 ```
 
-`logical_core_count` 表示 Runner 已知的总逻辑线程数。`configured_cores` 表示由 Parallax 管理、可用于核心绑定的核心集合。`available_cores` 表示当前尚未被 Parallax 任务租用的 `configured_cores` 子集，不表示操作系统层面的 CPU 空闲率。未声明 `core_pool` 或 `numa_nodes` 时，`configured_cores` 和 `available_cores` 为空列表。
+`logical_core_count` 表示 Runner 已知的总逻辑线程数。`configured_cores` 表示由 Parallux 管理、可用于核心绑定的核心集合。`available_cores` 表示当前尚未被 Parallux 任务租用的 `configured_cores` 子集，不表示操作系统层面的 CPU 空闲率。未声明 `core_pool` 或 `numa_nodes` 时，`configured_cores` 和 `available_cores` 为空列表。
 
 ## 命令选项
 
@@ -262,9 +262,9 @@ goal.schd(
 命令运行时会注入以下环境变量：
 
 ```text
-PARALLAX_RUNNER
-PARALLAX_WORK_RELPATH
-PARALLAX_WORK_DIR
+PARALLUX_RUNNER
+PARALLUX_WORK_RELPATH
+PARALLUX_WORK_DIR
 ```
 
 ## 输出文件
@@ -301,7 +301,7 @@ goal.setRunner(local)
 
 for index in range(2):
     goal.schd(
-        "echo runner=$PARALLAX_RUNNER",
+        "echo runner=$PARALLUX_RUNNER",
         runner=local,
         threads=1,
         numa_node=0,
@@ -318,7 +318,7 @@ goal.issue().sync()
 `workloads()` 用于根据输入路径生成稳定的工作路径，适用于批量 workload 场景。
 
 ```python
-from parallax import goal, workloads
+from parallux import goal, workloads
 
 
 for workload in workloads(
@@ -340,7 +340,7 @@ goal.issue().sync()
 
 ## 文件结构
 
-- `parallax/__init__.py`：公开 API、受控运行时入口、调度器、本地/SSH 执行逻辑以及 NUMA 分配逻辑
-- `parallax/__main__.py`：`python3 -m parallax` 入口
-- `parallax/_core.py`：核心配置模型和配置加载逻辑
-- `pyproject.toml`：包元数据和 `parallax` 命令入口
+- `parallux/__init__.py`：公开 API、受控运行时入口、调度器、本地/SSH 执行逻辑以及 NUMA 分配逻辑
+- `parallux/__main__.py`：`python3 -m parallux` 入口
+- `parallux/_core.py`：核心配置模型和配置加载逻辑
+- `pyproject.toml`：包元数据和 `parallux` 命令入口

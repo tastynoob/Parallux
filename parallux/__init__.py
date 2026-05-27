@@ -19,7 +19,7 @@ from typing import Any, BinaryIO, Iterable, Mapping, Protocol, Sequence
 from ._core import (
     CommandSpec as _CommandSpec,
     Goal as _RuntimeGoal,
-    ParallaxError,
+    ParalluxError,
     RunnerSpec as _RuntimeRunnerSpec,
     RunnerStatus,
     RuntimeOptions as _RuntimeOptions,
@@ -29,7 +29,7 @@ from ._core import (
 
 
 __version__ = "0.1.0"
-DEFAULT_WORKSPACE = "~/parallax"
+DEFAULT_WORKSPACE = "~/parallux"
 _NAME_RE = _re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -134,11 +134,11 @@ class RunnerSpec(Protocol):
         ...
 
     def configured_cores(self, *, numa_node: int | None = None) -> list[int]:
-        """Return core ids managed by Parallax for binding."""
+        """Return core ids managed by Parallux for binding."""
         ...
 
     def configured_core_count(self, *, numa_node: int | None = None) -> int:
-        """Return the number of cores managed by Parallax for binding."""
+        """Return the number of cores managed by Parallux for binding."""
         ...
 
     def available_cores(self, *, numa_node: int | None = None) -> list[int]:
@@ -277,8 +277,8 @@ class _Missing:
         if self._target is not None:
             return getattr(self._target, attr)
         raise RuntimeError(
-            f"parallax.{self._proxy_name} is not bound. Run the config through "
-            "parallax or python3 -m parallax to bind the real object."
+            f"parallux.{self._proxy_name} is not bound. Run the config through "
+            "parallux or python3 -m parallux to bind the real object."
         )
 
     def _bind(self, target: Any) -> None:
@@ -368,7 +368,7 @@ class GroupHandle:
                 errors.append(err)
         if errors:
             first = errors[0]
-            raise ParallaxError(f"{len(errors)} command(s) failed; first error: {first}") from first
+            raise ParalluxError(f"{len(errors)} command(s) failed; first error: {first}") from first
         return results
 
     def done(self) -> bool:
@@ -434,7 +434,7 @@ class CoreAllocator:
                 return None
         else:
             if numa_node is not None and not self.pool:
-                raise ParallaxError(
+                raise ParalluxError(
                     f"runner {self.spec.name!r} needs core_pool/numa_nodes for NUMA binding"
                 )
             requested = []
@@ -474,10 +474,10 @@ class CoreAllocator:
 
     def _validate_exact(self, cores: Sequence[int]) -> None:
         if not self.pool:
-            raise ParallaxError(f"runner {self.spec.name!r} needs core_pool for explicit cores")
+            raise ParalluxError(f"runner {self.spec.name!r} needs core_pool for explicit cores")
         unknown = set(cores) - set(self.pool)
         if unknown:
-            raise ParallaxError(
+            raise ParalluxError(
                 f"runner {self.spec.name!r} requested cores outside core_pool: "
                 f"{sorted(unknown)}"
             )
@@ -485,7 +485,7 @@ class CoreAllocator:
     def _try_allocate_count(self, count: int, numa_node: int | None) -> list[int] | None:
         pool = self._candidate_pool(numa_node)
         if not pool:
-            raise ParallaxError(
+            raise ParalluxError(
                 f"runner {self.spec.name!r} needs core_pool/numa_nodes for NUMA allocation"
             )
         available = [core for core in pool if core in self.available]
@@ -570,7 +570,7 @@ class Runtime:
         self.allocators: dict[str, CoreAllocator] = {}
         self._next_task_id = 1
         self.stopping = False
-        self.thread = threading.Thread(target=self._run_loop, name="parallax-scheduler", daemon=True)
+        self.thread = threading.Thread(target=self._run_loop, name="parallux-scheduler", daemon=True)
         self.thread.start()
 
     def submit(self, spec: _CommandSpec) -> Handle:
@@ -588,7 +588,7 @@ class Runtime:
 
     def _assign_task_id_locked(self, spec: _CommandSpec) -> None:
         if spec._task_id is not None:
-            raise ParallaxError(f"task has already been submitted: {spec._task_id}")
+            raise ParalluxError(f"task has already been submitted: {spec._task_id}")
         spec._task_id = self._next_task_id
         self._next_task_id += 1
 
@@ -769,7 +769,7 @@ class Runtime:
                 running.process.kill()
                 if running.stderr is not None:
                     running.stderr.write(
-                        f"parallax: command timed out after {running.spec.timeout}s\n".encode(
+                        f"parallux: command timed out after {running.spec.timeout}s\n".encode(
                             "utf-8"
                         )
                     )
@@ -797,7 +797,7 @@ class Runtime:
             )
             if running.spec.check and returncode != 0:
                 running.future.set_exception(
-                    ParallaxError(
+                    ParalluxError(
                         f"command failed with exit code {returncode}: {running.spec.command}"
                     )
                 )
@@ -812,7 +812,7 @@ class Runtime:
             self._ensure_runner(spec.runner)
             return [spec.runner]
         if not self.goal.runners:
-            raise ParallaxError("no runner configured")
+            raise ParalluxError("no runner configured")
         for runner in self.goal.runners:
             self._ensure_runner(runner)
         return sorted(
@@ -927,9 +927,9 @@ class Runtime:
         env.update(spec.env)
         env.update(
             {
-                "PARALLAX_RUNNER": runner.name,
-                "PARALLAX_WORK_RELPATH": work_relpath,
-                "PARALLAX_WORK_DIR": work_dir,
+                "PARALLUX_RUNNER": runner.name,
+                "PARALLUX_WORK_RELPATH": work_relpath,
+                "PARALLUX_WORK_DIR": work_dir,
             }
         )
         return {str(k): str(v) for k, v in env.items()}
@@ -966,7 +966,7 @@ class Runtime:
     ) -> str:
         invalid = [key for key in env if not self._valid_env_key(key)]
         if invalid:
-            raise ParallaxError(f"invalid environment variable name for ssh runner: {invalid[0]!r}")
+            raise ParalluxError(f"invalid environment variable name for ssh runner: {invalid[0]!r}")
         exports = " ".join(
             f"export {key}={shlex.quote(value)};" for key, value in sorted(env.items())
         )
@@ -982,7 +982,7 @@ class Runtime:
     @staticmethod
     def _task_id(spec: _CommandSpec) -> int:
         if spec._task_id is None:
-            raise ParallaxError("task has not been submitted")
+            raise ParalluxError("task has not been submitted")
         return spec._task_id
 
     def _task_id_text(self, spec: _CommandSpec) -> str:
@@ -1003,24 +1003,24 @@ def _split_config_args(values: Sequence[str]) -> tuple[list[str], dict[str, str]
 
 
 def run_runtime(argv: Sequence[str]) -> int:
-    parser = argparse.ArgumentParser(description="run a Parallax config in a controlled runtime")
+    parser = argparse.ArgumentParser(description="run a Parallux config in a controlled runtime")
     parser.add_argument("config", help="Python config file")
     parser.add_argument("--dry-run", action="store_true", help="write commands without executing them")
     raw_argv = list(argv)
     if "--" in raw_argv:
         marker = raw_argv.index("--")
-        parallax_argv = raw_argv[:marker]
+        parallux_argv = raw_argv[:marker]
         raw_config_args = raw_argv[marker + 1 :]
     else:
-        parallax_argv = raw_argv
+        parallux_argv = raw_argv
         raw_config_args = []
-    args = parser.parse_args(parallax_argv)
+    args = parser.parse_args(parallux_argv)
 
     config_path = Path(args.config).resolve()
     if config_path.suffix != ".py":
-        raise ParallaxError("config file must be a .py file")
+        raise ParalluxError("config file must be a .py file")
     if not config_path.exists():
-        raise ParallaxError(f"config file does not exist: {config_path}")
+        raise ParalluxError(f"config file does not exist: {config_path}")
 
     config_argv, config_args = _split_config_args(raw_config_args)
     options = _RuntimeOptions(
@@ -1044,15 +1044,15 @@ def run_runtime(argv: Sequence[str]) -> int:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    sys.modules.setdefault("parallax", sys.modules[__name__])
+    sys.modules.setdefault("parallux", sys.modules[__name__])
 
     try:
         return run_runtime(sys.argv[1:] if argv is None else argv)
-    except ParallaxError as err:
-        print(f"parallax: {err}", file=sys.stderr)
+    except ParalluxError as err:
+        print(f"parallux: {err}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
-        print("parallax: interrupted", file=sys.stderr)
+        print("parallux: interrupted", file=sys.stderr)
         return 130
 
 

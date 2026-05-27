@@ -11,7 +11,7 @@ from typing import Any, Iterable, Mapping, Sequence
 _NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
 
-class ParallaxError(RuntimeError):
+class ParalluxError(RuntimeError):
     pass
 
 
@@ -29,7 +29,7 @@ def _shell_join(argv: Sequence[Any]) -> str:
 def _validate_relative_path(value: str, *, label: str) -> str:
     path = Path(value)
     if not value or path.is_absolute() or ".." in path.parts:
-        raise ParallaxError(f"{label} must be a relative path")
+        raise ParalluxError(f"{label} must be a relative path")
     return path.as_posix()
 
 
@@ -37,7 +37,7 @@ def _normalize_threads(threads: int, thread: int | None) -> int:
     if thread is not None:
         threads = thread
     if threads < 0:
-        raise ParallaxError("threads must be >= 0")
+        raise ParalluxError("threads must be >= 0")
     return int(threads)
 
 
@@ -114,22 +114,22 @@ class RunnerSpec:
 
     def validate(self) -> None:
         if not self.name:
-            raise ParallaxError("runner name cannot be empty")
+            raise ParalluxError("runner name cannot be empty")
         if self.kind not in ("local", "ssh"):
-            raise ParallaxError(f"runner {self.name!r} kind must be 'local' or 'ssh'")
+            raise ParalluxError(f"runner {self.name!r} kind must be 'local' or 'ssh'")
         if self.port <= 0:
-            raise ParallaxError(f"runner {self.name!r} port must be > 0")
+            raise ParalluxError(f"runner {self.name!r} port must be > 0")
         if self.max_jobs is not None and self.max_jobs <= 0:
-            raise ParallaxError(f"runner {self.name!r} max_jobs must be > 0")
+            raise ParalluxError(f"runner {self.name!r} max_jobs must be > 0")
         for core in self.core_pool:
             if not isinstance(core, int) or core < 0:
-                raise ParallaxError(f"runner {self.name!r} core_pool must contain non-negative ints")
+                raise ParalluxError(f"runner {self.name!r} core_pool must contain non-negative ints")
         for node, cores in self.numa_nodes.items():
             if not isinstance(node, int) or node < 0:
-                raise ParallaxError(f"runner {self.name!r} numa node must be a non-negative int")
+                raise ParalluxError(f"runner {self.name!r} numa node must be a non-negative int")
             for core in cores:
                 if not isinstance(core, int) or core < 0:
-                    raise ParallaxError(
+                    raise ParalluxError(
                         f"runner {self.name!r} numa node cores must contain non-negative ints"
                     )
 
@@ -152,11 +152,11 @@ class RunnerSpec:
         return self.status(numa_node=numa_node).logical_core_count
 
     def configured_cores(self, *, numa_node: int | None = None) -> list[int]:
-        """Return core ids managed by Parallax for binding."""
+        """Return core ids managed by Parallux for binding."""
         return self.status(numa_node=numa_node).configured_cores
 
     def configured_core_count(self, *, numa_node: int | None = None) -> int:
-        """Return the number of cores managed by Parallax for binding."""
+        """Return the number of cores managed by Parallux for binding."""
         return self.status(numa_node=numa_node).configured_core_count
 
     def available_cores(self, *, numa_node: int | None = None) -> list[int]:
@@ -199,7 +199,7 @@ class RunnerSpec:
 
     def _bound_goal(self) -> Any:
         if self._goal is None:
-            raise ParallaxError(f"runner {self.name!r} is not bound to a goal")
+            raise ParalluxError(f"runner {self.name!r} is not bound to a goal")
         return self._goal
 
 
@@ -279,7 +279,7 @@ class Goal:
     def setRunner(self, runners: str | RunnerSpec | Sequence[str | RunnerSpec]) -> None:
         values = [runners] if isinstance(runners, (str, RunnerSpec)) else list(runners)
         if not values:
-            raise ParallaxError("goal.setRunner() needs at least one runner")
+            raise ParalluxError("goal.setRunner() needs at least one runner")
         parsed: list[RunnerSpec] = []
         for item in values:
             if isinstance(item, RunnerSpec):
@@ -289,19 +289,19 @@ class Goal:
             elif isinstance(item, str):
                 spec = self.ssh(item, host=item)
             else:
-                raise ParallaxError(f"unsupported runner value: {item!r}")
+                raise ParalluxError(f"unsupported runner value: {item!r}")
             spec.validate()
             parsed.append(spec)
         self.runners = parsed
 
     def setParallel(self, parallel: int) -> None:
         if parallel <= 0:
-            raise ParallaxError("goal.setParallel() must be > 0")
+            raise ParalluxError("goal.setParallel() must be > 0")
         self.parallel = int(parallel)
 
     def setEnv(self, key: str, value: Any) -> None:
         if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
-            raise ParallaxError(f"invalid environment variable name: {key!r}")
+            raise ParalluxError(f"invalid environment variable name: {key!r}")
         self.env[key] = str(value)
 
     def schd(
@@ -405,7 +405,7 @@ class Goal:
         timeout: float | None,
     ) -> CommandSpec:
         if not isinstance(command, str) or not command:
-            raise ParallaxError("command must be a non-empty string")
+            raise ParalluxError("command must be a non-empty string")
         if runner is not None:
             runner.bind(self).validate()
         command_index = self._command_index
@@ -432,7 +432,7 @@ class Goal:
 
     def _runtime_required(self) -> Any:
         if self._runtime is None:
-            raise ParallaxError("Parallax runtime is not bound; run with parallax <config.py>")
+            raise ParalluxError("Parallux runtime is not bound; run with parallux <config.py>")
         return self._runtime
 
 
@@ -445,14 +445,14 @@ def execute_config(path: Path, *, goal: Goal) -> None:
         except ValueError:
             pass
         sys.path.insert(0, path_item)
-    import parallax as parallax_shell
+    import parallux as parallux_shell
 
-    if not hasattr(parallax_shell, "_bind"):
-        raise ParallaxError("import parallax resolved to a module without runtime binding support")
-    parallax_shell._bind(goal)
+    if not hasattr(parallux_shell, "_bind"):
+        raise ParalluxError("import parallux resolved to a module without runtime binding support")
+    parallux_shell._bind(goal)
     globals_dict = {
         "__file__": str(path),
-        "__name__": "__parallax_config__",
+        "__name__": "__parallux_config__",
         "goal": goal,
     }
     code = compile(path.read_text(encoding="utf-8"), str(path), "exec")

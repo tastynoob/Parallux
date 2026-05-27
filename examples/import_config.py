@@ -1,6 +1,6 @@
-#!/usr/bin/env parallax
+#!/usr/bin/env parallux
 
-from parallax import goal
+from parallux import goal
 from task_helpers import build_print_command
 
 

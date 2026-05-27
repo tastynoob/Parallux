@@ -1,6 +1,6 @@
-#!/usr/bin/env parallax
+#!/usr/bin/env parallux
 
-from parallax import goal
+from parallux import goal
 
 
 local_a = goal.local(
@@ -16,7 +16,7 @@ goal.setParallel(2)
 
 for index in range(4):
     goal.schd(
-        "echo runner=$PARALLAX_RUNNER tag=$REMOTE_TAG",
+        "echo runner=$PARALLUX_RUNNER tag=$REMOTE_TAG",
         work_relpath=f"remote/{index}",
     )
 
