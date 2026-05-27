@@ -48,7 +48,7 @@ def _has_glob_magic(value: str) -> bool:
     return any(char in value for char in "*?[")
 
 
-def _tail_relpath(path: str, levels: int, *, strip_suffix: bool) -> str:
+def _tail_relpath(path: str, levels: int, *, strip_suffix: bool) -> str | None:
     if levels <= 0:
         raise ValueError("levels must be > 0")
     source = Path(path)
@@ -56,7 +56,7 @@ def _tail_relpath(path: str, levels: int, *, strip_suffix: bool) -> str:
     if source.anchor and parts and parts[0] == source.anchor:
         parts = parts[1:]
     if levels > len(parts):
-        raise ValueError(f"levels={levels} is deeper than path: {path}")
+        return None
     selected = parts[-levels:]
     if strip_suffix and selected:
         selected[-1] = Path(selected[-1]).with_suffix("").name
@@ -95,6 +95,8 @@ def workloads(
     result: list[Workload] = []
     for path in paths:
         relpath = _tail_relpath(path, levels, strip_suffix=strip_suffix)
+        if relpath is None:
+            continue
         work_relpath = f"{prefix}/{relpath}" if prefix else relpath
         result.append(
             Workload(
@@ -306,6 +308,38 @@ class CommandResult:
     numa_node: int | None
 
 
+class CommandFailure(ParalluxError):
+    def __init__(
+        self,
+        *,
+        returncode: int,
+        work_dir: str,
+        stderr_path: str,
+    ) -> None:
+        self.returncode = returncode
+        self.work_dir = work_dir
+        self.stderr_path = stderr_path
+        super().__init__("command failed")
+
+
+class TaskDispatchFailure(ParalluxError):
+    def __init__(
+        self,
+        *,
+        error: BaseException,
+        work_dir: str | None = None,
+        stderr_path: str | None = None,
+    ) -> None:
+        self.error = error
+        self.work_dir = work_dir
+        self.stderr_path = stderr_path
+        if work_dir is None:
+            message = f"task dispatch failed: {type(error).__name__}: {error}"
+        else:
+            message = "task dispatch failed before command execution"
+        super().__init__(message)
+
+
 class Handle:
     def __init__(self, future: Future[CommandResult], spec: _CommandSpec) -> None:
         self._future = future
@@ -367,8 +401,28 @@ class GroupHandle:
             except BaseException as err:
                 errors.append(err)
         if errors:
-            first = errors[0]
-            raise ParalluxError(f"{len(errors)} command(s) failed; first error: {first}") from first
+            messages: list[str] = []
+            command_errors = [err for err in errors if isinstance(err, CommandFailure)]
+            dispatch_errors = [
+                err for err in errors if isinstance(err, TaskDispatchFailure)
+            ]
+            other_errors = [
+                err
+                for err in errors
+                if not isinstance(err, (CommandFailure, TaskDispatchFailure))
+            ]
+            if command_errors:
+                messages.append(f"{len(command_errors)} command(s) failed")
+            if dispatch_errors:
+                messages.append(
+                    f"{len(dispatch_errors)} task(s) failed before command execution"
+                )
+            if other_errors:
+                messages.append(
+                    f"{len(other_errors)} task(s) failed with scheduler error; "
+                    f"first error: {other_errors[0]}"
+                )
+            raise ParalluxError("\n".join(messages)) from errors[0]
         return results
 
     def done(self) -> bool:
@@ -624,7 +678,12 @@ class Runtime:
                     launch = self._prepare_launch_locked(pending.spec)
                 except BaseException as err:
                     self.pending.remove(pending)
-                    pending.future.set_exception(err)
+                    if isinstance(err, TaskDispatchFailure):
+                        failure = err
+                    else:
+                        self._report_task_dispatch_failure(error=err)
+                        failure = TaskDispatchFailure(error=err)
+                    pending.future.set_exception(failure)
                     started = True
                     break
                 if launch is None:
@@ -644,7 +703,20 @@ class Runtime:
                     running = self._start_process(pending, launch)
                 except BaseException as err:
                     launch.lease.release()
-                    pending.future.set_exception(err)
+                    if isinstance(err, TaskDispatchFailure):
+                        failure = err
+                    else:
+                        self._report_task_dispatch_failure(
+                            work_dir=launch.work_dir,
+                            stderr_path=launch.stderr_path,
+                            error=err,
+                        )
+                        failure = TaskDispatchFailure(
+                            work_dir=launch.work_dir,
+                            stderr_path=launch.stderr_path,
+                            error=err,
+                        )
+                    pending.future.set_exception(failure)
                     started = True
                     break
                 if running is not None:
@@ -672,16 +744,29 @@ class Runtime:
                 continue
             work_relpath, work_dir, command_path, stdout_path, stderr_path = self._paths(spec, runner)
             full_command = lease.wrap(spec.command, runner.shell)
-            argv, env, cwd, local_artifacts = self._command_launch(
-                spec,
-                runner,
-                full_command,
-                work_relpath,
-                work_dir,
-                command_path,
-                stdout_path,
-                stderr_path,
-            )
+            try:
+                argv, env, cwd, local_artifacts = self._command_launch(
+                    spec,
+                    runner,
+                    full_command,
+                    work_relpath,
+                    work_dir,
+                    command_path,
+                    stdout_path,
+                    stderr_path,
+                )
+            except BaseException as err:
+                lease.release()
+                self._report_task_dispatch_failure(
+                    work_dir=work_dir,
+                    stderr_path=stderr_path,
+                    error=err,
+                )
+                raise TaskDispatchFailure(
+                    work_dir=work_dir,
+                    stderr_path=stderr_path,
+                    error=err,
+                ) from err
             return Launch(
                 runner=runner,
                 lease=lease,
@@ -796,9 +881,16 @@ class Runtime:
                 numa_node=running.lease.mem_node,
             )
             if running.spec.check and returncode != 0:
+                self._report_command_failure(
+                    returncode=returncode,
+                    work_dir=running.work_dir,
+                    stderr_path=running.stderr_path,
+                )
                 running.future.set_exception(
-                    ParalluxError(
-                        f"command failed with exit code {returncode}: {running.spec.command}"
+                    CommandFailure(
+                        work_dir=running.work_dir,
+                        stderr_path=running.stderr_path,
+                        returncode=returncode,
                     )
                 )
             else:
@@ -978,6 +1070,38 @@ class Runtime:
 
     def _default_work_relpath(self, spec: _CommandSpec) -> str:
         return self._task_id_text(spec)
+
+    @staticmethod
+    def _report_command_failure(
+        *,
+        work_dir: str,
+        stderr_path: str,
+        returncode: int,
+    ) -> None:
+        print(
+            f"command failed: {work_dir}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    @staticmethod
+    def _report_task_dispatch_failure(
+        *,
+        error: BaseException,
+        work_dir: str | None = None,
+        stderr_path: str | None = None,
+    ) -> None:
+        details = []
+        if work_dir is not None:
+            details.append(work_dir)
+        else:
+            details.append(f"error={type(error).__name__}: {error}")
+        print(
+            "parallux: task dispatch failed: "
+            + "; ".join(details),
+            file=sys.stderr,
+            flush=True,
+        )
 
     @staticmethod
     def _task_id(spec: _CommandSpec) -> int:
