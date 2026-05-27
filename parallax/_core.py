@@ -16,7 +16,10 @@ class ParallaxError(RuntimeError):
 
 
 def _sanitize(value: str) -> str:
-    return _NAME_RE.sub("_", value).strip("_") or "command"
+    cleaned = _NAME_RE.sub("_", value).strip("._")
+    if not cleaned or cleaned in (".", ".."):
+        return "task"
+    return cleaned
 
 
 def _shell_join(argv: Sequence[Any]) -> str:
@@ -42,16 +45,15 @@ def _normalize_threads(threads: int, thread: int | None) -> int:
 class RuntimeOptions:
     config_path: Path
     dry_run: bool = False
-    run_id: str | None = None
     argv: list[str] = field(default_factory=list)
     args: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class CommandSpec:
-    id: str
     command: str
     index: int
+    _task_id: int | None = field(default=None, repr=False)
     runner: RunnerSpec | None = None
     name: str | None = None
     threads: int = 0
@@ -62,6 +64,27 @@ class CommandSpec:
     work_relpath: str | None = None
     check: bool = True
     timeout: float | None = None
+
+
+@dataclass(frozen=True)
+class RunnerStatus:
+    """Snapshot of scheduler-visible Runner capacity.
+
+    Core availability only covers cores declared through core_pool or
+    numa_nodes. It is not an operating-system CPU utilization metric.
+    """
+
+    name: str
+    kind: str
+    active_jobs: int
+    max_jobs: int
+    available_jobs: int
+    logical_core_count: int
+    configured_cores: list[int]
+    configured_core_count: int
+    available_cores: list[int]
+    available_core_count: int
+    numa_node: int | None = None
 
 
 @dataclass
@@ -114,35 +137,35 @@ class RunnerSpec:
         self._goal = goal
         return self
 
-    def schd(
-        self,
-        command: str,
-        *,
-        name: str | None = None,
-        threads: int = 0,
-        thread: int | None = None,
-        numa_node: int | None = None,
-        cores: Sequence[int] | None = None,
-        env: Mapping[str, Any] | None = None,
-        cwd: str | None = None,
-        work_relpath: str | None = None,
-        check: bool = True,
-        timeout: float | None = None,
-    ) -> CommandSpec:
-        return self._bound_goal().schd(
-            command,
-            runner=self,
-            name=name,
-            threads=threads,
-            thread=thread,
-            numa_node=numa_node,
-            cores=cores,
-            env=env,
-            cwd=cwd,
-            work_relpath=work_relpath,
-            check=check,
-            timeout=timeout,
-        )
+    def status(self, *, numa_node: int | None = None) -> RunnerStatus:
+        return self._bound_goal().runner_status(self, numa_node=numa_node)
+
+    def active_jobs(self) -> int:
+        return self.status().active_jobs
+
+    def available_jobs(self) -> int:
+        """Return currently unused job slots for this Runner."""
+        return self.status().available_jobs
+
+    def logical_core_count(self, *, numa_node: int | None = None) -> int:
+        """Return total logical threads known for this Runner or NUMA node."""
+        return self.status(numa_node=numa_node).logical_core_count
+
+    def configured_cores(self, *, numa_node: int | None = None) -> list[int]:
+        """Return core ids managed by Parallax for binding."""
+        return self.status(numa_node=numa_node).configured_cores
+
+    def configured_core_count(self, *, numa_node: int | None = None) -> int:
+        """Return the number of cores managed by Parallax for binding."""
+        return self.status(numa_node=numa_node).configured_core_count
+
+    def available_cores(self, *, numa_node: int | None = None) -> list[int]:
+        """Return currently unleased configured core ids."""
+        return self.status(numa_node=numa_node).available_cores
+
+    def available_core_count(self, *, numa_node: int | None = None) -> int:
+        """Return the number of currently unleased configured cores."""
+        return self.status(numa_node=numa_node).available_core_count
 
     def run(
         self,
@@ -186,13 +209,9 @@ class Goal:
         *,
         mode: str,
         options: RuntimeOptions | None = None,
-        root_path: str = "workspace/log_root",
-        root_locked: bool = False,
     ) -> None:
         self.mode = mode
         self.options = options
-        self.root_path = root_path
-        self.root_locked = root_locked
         self.runners: list[RunnerSpec] = [self.local("local")]
         self.env: dict[str, str] = {}
         self.parallel = 1
@@ -200,7 +219,7 @@ class Goal:
         self.args = dict(options.args if options else {})
         self._runtime: Any | None = None
         self._scheduled: list[CommandSpec] = []
-        self._name_counts: dict[str, int] = {}
+        self._command_index = 0
 
     def bind_runtime(self, runtime: Any) -> None:
         self._runtime = runtime
@@ -285,13 +304,6 @@ class Goal:
             raise ParallaxError(f"invalid environment variable name: {key!r}")
         self.env[key] = str(value)
 
-    def setRoot(self, root_path: str) -> None:
-        if self.root_locked:
-            return
-        if not root_path:
-            raise ParallaxError("goal.setRoot() needs a non-empty path")
-        self.root_path = str(root_path)
-
     def schd(
         self,
         command: str,
@@ -365,6 +377,17 @@ class Goal:
     def has_scheduled(self) -> bool:
         return bool(self._scheduled)
 
+    def runner_status(
+        self,
+        runner: RunnerSpec | None = None,
+        *,
+        numa_node: int | None = None,
+    ) -> RunnerStatus | list[RunnerStatus]:
+        runtime = self._runtime_required()
+        if runner is None:
+            return [runtime.runner_status(item, numa_node=numa_node) for item in self.runners]
+        return runtime.runner_status(runner, numa_node=numa_node)
+
     def _make_command(
         self,
         command: str,
@@ -385,18 +408,17 @@ class Goal:
             raise ParallaxError("command must be a non-empty string")
         if runner is not None:
             runner.bind(self).validate()
-        base_name = _sanitize(name or "cmd")
-        command_id = self._next_command_id(base_name)
+        command_index = self._command_index
+        self._command_index += 1
         normalized_work_relpath = (
             _validate_relative_path(work_relpath, label="work_relpath")
             if work_relpath is not None
             else None
         )
         return CommandSpec(
-            id=command_id,
-            name=base_name,
             command=command,
-            index=sum(self._name_counts.values()),
+            index=command_index,
+            name=_sanitize(name) if name is not None else None,
             runner=runner,
             threads=_normalize_threads(threads, thread),
             numa_node=numa_node,
@@ -408,33 +430,13 @@ class Goal:
             timeout=timeout,
         )
 
-    def _next_command_id(self, base_name: str) -> str:
-        count = self._name_counts.get(base_name, 0) + 1
-        self._name_counts[base_name] = count
-        if count == 1:
-            return base_name
-        return f"{base_name}.{count}"
-
     def _runtime_required(self) -> Any:
         if self._runtime is None:
             raise ParallaxError("Parallax runtime is not bound; run with parallax <config.py>")
         return self._runtime
 
 
-class AutoRunner:
-    name = "auto"
-
-    def __init__(self, goal: Goal) -> None:
-        self.goal = goal
-
-    def schd(self, command: str, **kwargs: Any) -> CommandSpec:
-        return self.goal.schd(command, **kwargs)
-
-    def run(self, command: str, **kwargs: Any) -> Any:
-        return self.goal.run(command, **kwargs)
-
-
-def execute_config(path: Path, *, goal: Goal, runner: Any) -> None:
+def execute_config(path: Path, *, goal: Goal) -> None:
     project_root = str(Path(__file__).resolve().parent.parent)
     config_dir = str(path.resolve().parent)
     for path_item in (config_dir, project_root):
@@ -447,12 +449,11 @@ def execute_config(path: Path, *, goal: Goal, runner: Any) -> None:
 
     if not hasattr(parallax_shell, "_bind"):
         raise ParallaxError("import parallax resolved to a module without runtime binding support")
-    parallax_shell._bind(goal, runner)
+    parallax_shell._bind(goal)
     globals_dict = {
         "__file__": str(path),
         "__name__": "__parallax_config__",
         "goal": goal,
-        "runner": runner,
     }
     code = compile(path.read_text(encoding="utf-8"), str(path), "exec")
     exec(code, globals_dict)

@@ -17,19 +17,19 @@ from typing import Any, BinaryIO, Iterable, Mapping, Protocol, Sequence
 
 
 from ._core import (
-    AutoRunner as _AutoRunner,
     CommandSpec as _CommandSpec,
     Goal as _RuntimeGoal,
     ParallaxError,
     RunnerSpec as _RuntimeRunnerSpec,
+    RunnerStatus,
     RuntimeOptions as _RuntimeOptions,
-    _sanitize,
     _shell_join,
     execute_config,
 )
 
 
 __version__ = "0.1.0"
+DEFAULT_WORKSPACE = "~/parallax"
 _NAME_RE = _re.compile(r"[^A-Za-z0-9_.-]+")
 
 
@@ -121,21 +121,33 @@ class RunnerSpec(Protocol):
     numa_nodes: dict[int, list[int]]
     ssh_options: list[str]
 
-    def schd(
-        self,
-        command: str,
-        *,
-        name: str | None = None,
-        threads: int = 0,
-        thread: int | None = None,
-        numa_node: int | None = None,
-        cores: Sequence[int] | None = None,
-        env: Mapping[str, str] | None = None,
-        cwd: str | None = None,
-        work_relpath: str | None = None,
-        check: bool = True,
-        timeout: float | None = None,
-    ) -> Any: ...
+    def status(self, *, numa_node: int | None = None) -> RunnerStatus: ...
+
+    def active_jobs(self) -> int: ...
+
+    def available_jobs(self) -> int:
+        """Return currently unused job slots for this Runner."""
+        ...
+
+    def logical_core_count(self, *, numa_node: int | None = None) -> int:
+        """Return total logical threads known for this Runner or NUMA node."""
+        ...
+
+    def configured_cores(self, *, numa_node: int | None = None) -> list[int]:
+        """Return core ids managed by Parallax for binding."""
+        ...
+
+    def configured_core_count(self, *, numa_node: int | None = None) -> int:
+        """Return the number of cores managed by Parallax for binding."""
+        ...
+
+    def available_cores(self, *, numa_node: int | None = None) -> list[int]:
+        """Return currently unleased configured core ids."""
+        ...
+
+    def available_core_count(self, *, numa_node: int | None = None) -> int:
+        """Return the number of currently unleased configured cores."""
+        ...
 
     def run(
         self,
@@ -155,14 +167,26 @@ class RunnerSpec(Protocol):
 
 
 class Handle(Protocol):
+    command: str
+    runner: RunnerSpec | None
+    runner_name: str | None
+    work_relpath: str | None
+    work_dir: str | None
+    command_path: str | None
+    stdout_path: str | None
+    stderr_path: str | None
+    cores: tuple[int, ...]
+    numa_node: int | None
+
     def sync(self, timeout: float | None = None) -> Any: ...
 
     def done(self) -> bool: ...
 
+    def assigned(self) -> bool: ...
+
 
 class GoalShell(Protocol):
     mode: str
-    root_path: str
     argv: list[str]
     args: dict[str, str]
 
@@ -200,8 +224,6 @@ class GoalShell(Protocol):
 
     def setEnv(self, key: str, value: Any) -> None: ...
 
-    def setRoot(self, root_path: str) -> None: ...
-
     def schd(
         self,
         command: str,
@@ -238,8 +260,12 @@ class GoalShell(Protocol):
 
     def issue(self) -> Handle: ...
 
-
-RunnerShell = RunnerSpec
+    def runner_status(
+        self,
+        runner: RunnerSpec | None = None,
+        *,
+        numa_node: int | None = None,
+    ) -> RunnerStatus | list[RunnerStatus]: ...
 
 
 class _Missing:
@@ -260,33 +286,72 @@ class _Missing:
 
 
 goal: GoalShell = _Missing("goal")  # type: ignore[assignment]
-runner: RunnerShell = _Missing("runner")  # type: ignore[assignment]
 
 
-def _bind(real_goal: Any, real_runner: Any) -> None:
+def _bind(real_goal: Any) -> None:
     goal._bind(real_goal)  # type: ignore[attr-defined]
-    runner._bind(real_runner)  # type: ignore[attr-defined]
 
 
 @dataclass(frozen=True)
 class CommandResult:
-    id: str
     runner: str
     command: str
     returncode: int
-    log_dir: str
+    work_relpath: str
     work_dir: str
+    command_path: str
+    stdout_path: str
+    stderr_path: str
+    cores: tuple[int, ...]
+    numa_node: int | None
 
 
 class Handle:
-    def __init__(self, future: Future[CommandResult]) -> None:
+    def __init__(self, future: Future[CommandResult], spec: _CommandSpec) -> None:
         self._future = future
+        self.command = spec.command
+        self.runner: _RuntimeRunnerSpec | None = None
+        self.runner_name: str | None = None
+        self.work_relpath: str | None = None
+        self.work_dir: str | None = None
+        self.command_path: str | None = None
+        self.stdout_path: str | None = None
+        self.stderr_path: str | None = None
+        self.cores: tuple[int, ...] = ()
+        self.numa_node = spec.numa_node
+        self._lock = threading.Lock()
 
     def sync(self, timeout: float | None = None) -> CommandResult:
         return self._future.result(timeout=timeout)
 
     def done(self) -> bool:
         return self._future.done()
+
+    def assigned(self) -> bool:
+        return self.runner is not None
+
+    def _assign(
+        self,
+        *,
+        runner: _RuntimeRunnerSpec,
+        work_relpath: str,
+        work_dir: str,
+        command_path: str,
+        stdout_path: str,
+        stderr_path: str,
+        cores: Sequence[int],
+        numa_node: int | None,
+    ) -> None:
+        with self._lock:
+            self.runner = runner
+            self.runner_name = runner.name
+            self.work_relpath = work_relpath
+            self.work_dir = work_dir
+            self.command_path = command_path
+            self.stdout_path = stdout_path
+            self.stderr_path = stderr_path
+            self.cores = tuple(int(core) for core in cores)
+            self.numa_node = numa_node
 
 
 class GroupHandle:
@@ -382,6 +447,31 @@ class CoreAllocator:
             return
         self.available.update(int(core) for core in cores if int(core) in set(self.pool))
 
+    def logical_core_count(self, numa_node: int | None = None) -> int:
+        pool = self._candidate_pool(numa_node)
+        if pool:
+            return len(set(pool))
+        if self.spec.kind == "local":
+            return os.cpu_count() or 0
+        return 0
+
+    def configured_cores(self, numa_node: int | None = None) -> list[int]:
+        return sorted(set(self._candidate_pool(numa_node)))
+
+    def configured_core_count(self, numa_node: int | None = None) -> int:
+        return len(self.configured_cores(numa_node))
+
+    def available_cores(self, numa_node: int | None = None) -> list[int]:
+        return [core for core in self.configured_cores(numa_node) if core in self.available]
+
+    def available_core_count(self, numa_node: int | None = None) -> int:
+        return len(self.available_cores(numa_node))
+
+    def scheduling_core_score(self, numa_node: int | None = None) -> int:
+        if self.pool:
+            return self.available_core_count(numa_node)
+        return self.logical_core_count(numa_node)
+
     def _validate_exact(self, cores: Sequence[int]) -> None:
         if not self.pool:
             raise ParallaxError(f"runner {self.spec.name!r} needs core_pool for explicit cores")
@@ -431,6 +521,23 @@ class CoreAllocator:
 class PendingCommand:
     spec: _CommandSpec
     future: Future[CommandResult]
+    handle: Handle
+
+
+@dataclass
+class Launch:
+    runner: _RuntimeRunnerSpec
+    lease: CoreLease
+    argv: list[str]
+    env: dict[str, str] | None
+    cwd: str | None
+    work_relpath: str
+    work_dir: str
+    command_path: str
+    stdout_path: str
+    stderr_path: str
+    full_command: str
+    local_artifacts: bool
 
 
 @dataclass
@@ -439,40 +546,51 @@ class RunningCommand:
     runner: _RuntimeRunnerSpec
     process: subprocess.Popen[bytes]
     future: Future[CommandResult]
-    stdout: BinaryIO
-    stderr: BinaryIO
+    handle: Handle
+    stdout: BinaryIO | None
+    stderr: BinaryIO | None
     lease: CoreLease
     started_at: float
-    log_dir: Path
+    work_relpath: str
     work_dir: str
+    command_path: str
+    stdout_path: str
+    stderr_path: str
 
 
 class Runtime:
     def __init__(self, goal: _RuntimeGoal, options: _RuntimeOptions) -> None:
         self.goal = goal
         self.options = options
-        self.run_id = options.run_id or self._make_run_id()
         self.condition = threading.Condition()
         self.pending: list[PendingCommand] = []
         self.running: list[RunningCommand] = []
         self.handles: list[Handle] = []
         self.runner_active: dict[str, int] = {}
         self.allocators: dict[str, CoreAllocator] = {}
+        self._next_task_id = 1
         self.stopping = False
         self.thread = threading.Thread(target=self._run_loop, name="parallax-scheduler", daemon=True)
         self.thread.start()
 
     def submit(self, spec: _CommandSpec) -> Handle:
         future: Future[CommandResult] = Future()
-        handle = Handle(future)
         with self.condition:
-            self.pending.append(PendingCommand(spec=spec, future=future))
+            self._assign_task_id_locked(spec)
+            handle = Handle(future, spec)
+            self.pending.append(PendingCommand(spec=spec, future=future, handle=handle))
             self.handles.append(handle)
             self.condition.notify_all()
         return handle
 
     def submit_many(self, specs: Sequence[_CommandSpec]) -> GroupHandle:
         return GroupHandle([self.submit(spec) for spec in specs])
+
+    def _assign_task_id_locked(self, spec: _CommandSpec) -> None:
+        if spec._task_id is not None:
+            raise ParallaxError(f"task has already been submitted: {spec._task_id}")
+        spec._task_id = self._next_task_id
+        self._next_task_id += 1
 
     def finalize(self) -> None:
         if self.goal.has_scheduled():
@@ -511,44 +629,36 @@ class Runtime:
                     break
                 if launch is None:
                     continue
-                runner, lease, argv, env, cwd, log_dir, work_dir, full_command = launch
+                pending.handle._assign(
+                    runner=launch.runner,
+                    work_relpath=launch.work_relpath,
+                    work_dir=launch.work_dir,
+                    command_path=launch.command_path,
+                    stdout_path=launch.stdout_path,
+                    stderr_path=launch.stderr_path,
+                    cores=launch.lease.cores,
+                    numa_node=launch.lease.mem_node,
+                )
                 self.pending.remove(pending)
                 try:
-                    running = self._start_process(
-                        pending,
-                        runner,
-                        lease,
-                        argv,
-                        env,
-                        cwd,
-                        log_dir,
-                        work_dir,
-                        full_command,
-                    )
+                    running = self._start_process(pending, launch)
                 except BaseException as err:
-                    lease.release()
+                    launch.lease.release()
                     pending.future.set_exception(err)
                     started = True
                     break
                 if running is not None:
                     self.running.append(running)
-                    self.runner_active[runner.name] = self.runner_active.get(runner.name, 0) + 1
+                    self.runner_active[launch.runner.name] = (
+                        self.runner_active.get(launch.runner.name, 0) + 1
+                    )
                 started = True
                 break
 
     def _prepare_launch_locked(
         self,
         spec: _CommandSpec,
-    ) -> tuple[
-        _RuntimeRunnerSpec,
-        CoreLease,
-        list[str],
-        dict[str, str] | None,
-        str | None,
-        Path,
-        str,
-        str,
-    ] | None:
+    ) -> Launch | None:
         for runner in self._candidate_runners(spec):
             if self.runner_active.get(runner.name, 0) >= (runner.max_jobs or self.goal.parallel):
                 continue
@@ -560,64 +670,92 @@ class Runtime:
             )
             if lease is None:
                 continue
-            log_dir, work_dir = self._paths(spec, runner)
+            work_relpath, work_dir, command_path, stdout_path, stderr_path = self._paths(spec, runner)
             full_command = lease.wrap(spec.command, runner.shell)
-            argv, env, cwd = self._command_launch(spec, runner, full_command, work_dir)
-            return runner, lease, argv, env, cwd, log_dir, work_dir, full_command
+            argv, env, cwd, local_artifacts = self._command_launch(
+                spec,
+                runner,
+                full_command,
+                work_relpath,
+                work_dir,
+                command_path,
+                stdout_path,
+                stderr_path,
+            )
+            return Launch(
+                runner=runner,
+                lease=lease,
+                argv=argv,
+                env=env,
+                cwd=cwd,
+                work_relpath=work_relpath,
+                work_dir=work_dir,
+                command_path=command_path,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                full_command=full_command,
+                local_artifacts=local_artifacts,
+            )
         return None
 
     def _start_process(
         self,
         pending: PendingCommand,
-        runner: _RuntimeRunnerSpec,
-        lease: CoreLease,
-        argv: list[str],
-        env: dict[str, str] | None,
-        cwd: str | None,
-        log_dir: Path,
-        work_dir: str,
-        full_command: str,
+        launch: Launch,
     ) -> RunningCommand | None:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with (log_dir / "command.txt").open("w", encoding="utf-8") as fs:
-            fs.write(pending.spec.command)
-            fs.write("\n")
-            fs.write(f"executor: {_shell_join(argv)}\n")
-        stdout = (log_dir / "stdout.log").open("wb")
-        stderr = (log_dir / "stderr.log").open("wb")
+        stdout: BinaryIO | None = None
+        stderr: BinaryIO | None = None
+        if launch.local_artifacts:
+            Path(launch.work_dir).mkdir(parents=True, exist_ok=True)
+            with Path(launch.command_path).open("w", encoding="utf-8") as fs:
+                fs.write(pending.spec.command)
+                fs.write("\n")
+                fs.write(f"executor: {_shell_join(launch.argv)}\n")
+            stdout = Path(launch.stdout_path).open("wb")
+            stderr = Path(launch.stderr_path).open("wb")
         if self.options.dry_run:
-            stdout.write(f"[dry-run] {full_command}\n".encode("utf-8"))
-            stdout.close()
-            stderr.close()
-            lease.release()
+            if stdout is not None:
+                stdout.write(f"[dry-run] {launch.full_command}\n".encode("utf-8"))
+                stdout.close()
+            if stderr is not None:
+                stderr.close()
+            launch.lease.release()
             result = CommandResult(
-                id=pending.spec.id,
-                runner=runner.name,
+                runner=launch.runner.name,
                 command=pending.spec.command,
                 returncode=0,
-                log_dir=str(log_dir),
-                work_dir=work_dir,
+                work_relpath=launch.work_relpath,
+                work_dir=launch.work_dir,
+                command_path=launch.command_path,
+                stdout_path=launch.stdout_path,
+                stderr_path=launch.stderr_path,
+                cores=tuple(launch.lease.cores),
+                numa_node=launch.lease.mem_node,
             )
             pending.future.set_result(result)
             return None
         process = subprocess.Popen(
-            argv,
-            stdout=stdout,
-            stderr=stderr,
-            env=env,
-            cwd=cwd,
+            launch.argv,
+            stdout=stdout if stdout is not None else subprocess.DEVNULL,
+            stderr=stderr if stderr is not None else subprocess.DEVNULL,
+            env=launch.env,
+            cwd=launch.cwd,
         )
         return RunningCommand(
             spec=pending.spec,
-            runner=runner,
+            runner=launch.runner,
             process=process,
             future=pending.future,
+            handle=pending.handle,
             stdout=stdout,
             stderr=stderr,
-            lease=lease,
+            lease=launch.lease,
             started_at=time.time(),
-            log_dir=log_dir,
-            work_dir=work_dir,
+            work_relpath=launch.work_relpath,
+            work_dir=launch.work_dir,
+            command_path=launch.command_path,
+            stdout_path=launch.stdout_path,
+            stderr_path=launch.stderr_path,
         )
 
     def _poll_running_locked(self) -> float:
@@ -629,30 +767,38 @@ class Runtime:
             )
             if timed_out and running.process.poll() is None:
                 running.process.kill()
-                running.stderr.write(
-                    f"parallax: command timed out after {running.spec.timeout}s\n".encode("utf-8")
-                )
+                if running.stderr is not None:
+                    running.stderr.write(
+                        f"parallax: command timed out after {running.spec.timeout}s\n".encode(
+                            "utf-8"
+                        )
+                    )
             returncode = running.process.poll()
             if returncode is None:
                 continue
             self.running.remove(running)
             self.runner_active[running.runner.name] -= 1
             running.lease.release()
-            running.stdout.close()
-            running.stderr.close()
+            if running.stdout is not None:
+                running.stdout.close()
+            if running.stderr is not None:
+                running.stderr.close()
             result = CommandResult(
-                id=running.spec.id,
                 runner=running.runner.name,
                 command=running.spec.command,
                 returncode=returncode,
-                log_dir=str(running.log_dir),
+                work_relpath=running.work_relpath,
                 work_dir=running.work_dir,
+                command_path=running.command_path,
+                stdout_path=running.stdout_path,
+                stderr_path=running.stderr_path,
+                cores=tuple(running.lease.cores),
+                numa_node=running.lease.mem_node,
             )
             if running.spec.check and returncode != 0:
                 running.future.set_exception(
                     ParallaxError(
-                        f"command {running.spec.id!r} failed with exit code "
-                        f"{returncode}: {running.spec.command}"
+                        f"command failed with exit code {returncode}: {running.spec.command}"
                     )
                 )
             else:
@@ -671,12 +817,14 @@ class Runtime:
             self._ensure_runner(runner)
         return sorted(
             self.goal.runners,
-            key=lambda item: (
-                self.runner_active.get(item.name, 0) / float(item.max_jobs or self.goal.parallel),
-                self.runner_active.get(item.name, 0),
-                item.name,
-            ),
+            key=lambda item: self._runner_sort_key(item, spec),
         )
+
+    def _runner_sort_key(self, runner: _RuntimeRunnerSpec, spec: _CommandSpec) -> tuple[float, int, int, str]:
+        active = self.runner_active.get(runner.name, 0)
+        max_jobs = runner.max_jobs or self.goal.parallel
+        core_score = self._allocator(runner).scheduling_core_score(spec.numa_node)
+        return active / float(max_jobs), active, -core_score, runner.name
 
     def _ensure_runner(self, runner: _RuntimeRunnerSpec) -> None:
         runner.bind(self.goal).validate()
@@ -687,64 +835,128 @@ class Runtime:
         self._ensure_runner(runner)
         return self.allocators[runner.name]
 
-    def _paths(self, spec: _CommandSpec, runner: _RuntimeRunnerSpec) -> tuple[Path, str]:
-        relpath = spec.work_relpath or f"parallax-{self.run_id}/{_sanitize(spec.id)}-{runner.name}"
-        log_dir = Path(self.goal.root_path) / relpath
-        workspace = runner.workspace or self.goal.root_path
-        work_path = Path(workspace) / relpath
+    def runner_status(
+        self,
+        runner: _RuntimeRunnerSpec,
+        *,
+        numa_node: int | None = None,
+    ) -> RunnerStatus:
+        with self.condition:
+            self._ensure_runner(runner)
+            allocator = self._allocator(runner)
+            active = self.runner_active.get(runner.name, 0)
+            max_jobs = runner.max_jobs or self.goal.parallel
+            configured_cores = allocator.configured_cores(numa_node)
+            available_cores = allocator.available_cores(numa_node)
+            return RunnerStatus(
+                name=runner.name,
+                kind=runner.kind,
+                active_jobs=active,
+                max_jobs=max_jobs,
+                available_jobs=max(0, max_jobs - active),
+                logical_core_count=allocator.logical_core_count(numa_node),
+                configured_cores=configured_cores,
+                configured_core_count=len(configured_cores),
+                available_cores=available_cores,
+                available_core_count=len(available_cores),
+                numa_node=numa_node,
+            )
+
+    def _paths(self, spec: _CommandSpec, runner: _RuntimeRunnerSpec) -> tuple[str, str, str, str, str]:
+        relpath = spec.work_relpath or self._default_work_relpath(spec)
+        workspace = runner.workspace or DEFAULT_WORKSPACE
         if runner.kind == "local":
+            work_path = Path(workspace).expanduser()
+            if relpath:
+                work_path = work_path / relpath
             work_dir = str(work_path.resolve())
         else:
-            work_dir = work_path.as_posix()
-        return log_dir, work_dir
+            work_dir = self._remote_join(workspace, relpath)
+        command_path = self._join_path(work_dir, "command.txt", runner=runner)
+        stdout_path = self._join_path(work_dir, "stdout.txt", runner=runner)
+        stderr_path = self._join_path(work_dir, "stderr.txt", runner=runner)
+        return relpath, work_dir, command_path, stdout_path, stderr_path
 
     def _command_launch(
         self,
         spec: _CommandSpec,
         runner: _RuntimeRunnerSpec,
         full_command: str,
+        work_relpath: str,
         work_dir: str,
-    ) -> tuple[list[str], dict[str, str] | None, str | None]:
-        env = self._command_env(spec, runner, work_dir)
+        command_path: str,
+        stdout_path: str,
+        stderr_path: str,
+    ) -> tuple[list[str], dict[str, str] | None, str | None, bool]:
+        env = self._command_env(spec, runner, work_dir, work_relpath)
         if runner.kind == "local":
             Path(work_dir).mkdir(parents=True, exist_ok=True)
             process_env = os.environ.copy()
             process_env.update(env)
-            return [runner.shell, "-lc", full_command], process_env, spec.cwd or work_dir
+            return [runner.shell, "-lc", full_command], process_env, spec.cwd or work_dir, True
 
         remote_cwd = spec.cwd or work_dir
         remote_body = " && ".join(
             [
-                f"mkdir -p {shlex.quote(work_dir)}",
-                f"cd {shlex.quote(remote_cwd)}",
-                f"{{ {self._remote_shell_body(runner, env, full_command)}; }}",
+                f"mkdir -p {self._quote_remote_path(work_dir)}",
+                (
+                    f"printf '%s\\n' {shlex.quote(spec.command)} "
+                    f"> {self._quote_remote_path(command_path)}"
+                ),
+                f"cd {self._quote_remote_path(remote_cwd)}",
+                (
+                    f"{{ {self._remote_shell_body(runner, env, full_command)}; }} "
+                    f"> {self._quote_remote_path(stdout_path)} "
+                    f"2> {self._quote_remote_path(stderr_path)}"
+                ),
             ]
         )
         argv = ["ssh", *runner.ssh_options, "-p", str(runner.port), runner.target]
         argv.extend([runner.shell, "-lc", shlex.quote(remote_body)])
-        return argv, None, None
+        return argv, None, None, False
 
     def _command_env(
         self,
         spec: _CommandSpec,
         runner: _RuntimeRunnerSpec,
         work_dir: str,
+        work_relpath: str,
     ) -> dict[str, str]:
         env = dict(self.goal.env)
         env.update(runner.env)
         env.update(spec.env)
-        relpath = spec.work_relpath or f"parallax-{self.run_id}/{_sanitize(spec.id)}-{runner.name}"
-        log_dir = Path(self.goal.root_path) / relpath
         env.update(
             {
-                "PARALLAX_RUN_ID": self.run_id,
                 "PARALLAX_RUNNER": runner.name,
-                "PARALLAX_WORK_RELPATH": relpath,
+                "PARALLAX_WORK_RELPATH": work_relpath,
                 "PARALLAX_WORK_DIR": work_dir,
-                "PARALLAX_LOG_DIR": str(log_dir),
             }
         )
         return {str(k): str(v) for k, v in env.items()}
+
+    @staticmethod
+    def _join_path(work_dir: str, filename: str, *, runner: _RuntimeRunnerSpec) -> str:
+        if runner.kind == "local":
+            return str(Path(work_dir) / filename)
+        return f"{work_dir.rstrip('/')}/{filename}"
+
+    @staticmethod
+    def _remote_join(workspace: str, relpath: str) -> str:
+        base = workspace.rstrip("/")
+        if not relpath:
+            return base
+        return f"{base}/{relpath}"
+
+    @staticmethod
+    def _quote_remote_path(path: str) -> str:
+        if path == "~":
+            return "~"
+        if path.startswith("~/"):
+            rest = path[2:]
+            if not rest:
+                return "~"
+            return "~/" + "/".join(shlex.quote(part) for part in rest.split("/"))
+        return shlex.quote(path)
 
     def _remote_shell_body(
         self,
@@ -764,11 +976,17 @@ class Runtime:
     def _valid_env_key(key: str) -> bool:
         return re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key) is not None
 
+    def _default_work_relpath(self, spec: _CommandSpec) -> str:
+        return self._task_id_text(spec)
+
     @staticmethod
-    def _make_run_id() -> str:
-        now = time.time()
-        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
-        return f"{stamp}-{int((now % 1) * 1000):03d}-{os.getpid()}"
+    def _task_id(spec: _CommandSpec) -> int:
+        if spec._task_id is None:
+            raise ParallaxError("task has not been submitted")
+        return spec._task_id
+
+    def _task_id_text(self, spec: _CommandSpec) -> str:
+        return str(self._task_id(spec))
 
 
 def _split_config_args(values: Sequence[str]) -> tuple[list[str], dict[str, str]]:
@@ -788,8 +1006,6 @@ def run_runtime(argv: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description="run a Parallax config in a controlled runtime")
     parser.add_argument("config", help="Python config file")
     parser.add_argument("--dry-run", action="store_true", help="write commands without executing them")
-    parser.add_argument("--root", help="override log root")
-    parser.add_argument("--run-id", help="override generated run id")
     raw_argv = list(argv)
     if "--" in raw_argv:
         marker = raw_argv.index("--")
@@ -810,20 +1026,14 @@ def run_runtime(argv: Sequence[str]) -> int:
     options = _RuntimeOptions(
         config_path=config_path,
         dry_run=args.dry_run,
-        run_id=args.run_id,
         argv=config_argv,
         args=config_args,
     )
-    real_goal = _RuntimeGoal(
-        mode="runtime",
-        options=options,
-        root_path=args.root or "workspace/log_root",
-        root_locked=args.root is not None,
-    )
+    real_goal = _RuntimeGoal(mode="runtime", options=options)
     runtime = Runtime(real_goal, options)
     real_goal.bind_runtime(runtime)
     try:
-        execute_config(config_path, goal=real_goal, runner=_AutoRunner(real_goal))
+        execute_config(config_path, goal=real_goal)
         runtime.finalize()
     finally:
         with runtime.condition:
@@ -849,11 +1059,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "GoalShell",
     "Handle",
-    "RunnerShell",
     "RunnerSpec",
+    "RunnerStatus",
     "Workload",
     "goal",
-    "runner",
     "workloads",
 ]
 

@@ -13,7 +13,13 @@ goal.setRunner(local)
 goal.setParallel(2)
 
 
-for _ in range(2):
-    local.schd("echo runner=$USER", threads=1, numa_node=0)
+for index in range(2):
+    goal.schd(
+        "echo runner=$USER",
+        runner=local,
+        threads=1,
+        numa_node=0,
+        work_relpath=f"numa/{index}",
+    )
 
 goal.issue().sync()

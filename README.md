@@ -4,13 +4,13 @@ Parallax 是一个基于 Python 配置文件的命令提交与调度运行时，
 
 ## 概述
 
-Parallax 配置文件需要在受控运行时中执行。配置文件通过 `from parallax import goal, runner` 获取运行时对象，并使用 Python 语法描述 Runner、环境变量、命令注册和调度流程。
+Parallax 配置文件需要在受控运行时中执行。配置文件通过 `from parallax import goal` 获取运行时对象，并使用 Python 语法描述 Runner、环境变量、命令注册和调度流程。
 
 ```bash
 parallax config.py -- key=value
 ```
 
-配置文件可以作为普通 Python 文件编辑，但不应直接通过 `python3 config.py` 执行。Parallax 会在运行前绑定 `goal` 和 `runner`，从而确保配置文件始终在受控环境中运行。
+配置文件可以作为普通 Python 文件编辑，但不应直接通过 `python3 config.py` 执行。Parallax 会在运行前绑定 `goal`，从而确保配置文件始终在受控环境中运行。
 
 ```python
 from parallax import goal
@@ -22,8 +22,11 @@ local_b = goal.local(name="local-b", env={"RUNNER_TAG": "B"}, max_jobs=1)
 goal.setRunner([local_a, local_b])
 goal.setParallel(2)
 
-for _ in range(10):
-    goal.schd("echo runner=$PARALLAX_RUNNER tag=$RUNNER_TAG")
+for index in range(10):
+    goal.schd(
+        "echo runner=$PARALLAX_RUNNER tag=$RUNNER_TAG",
+        name=f"run_{index}",
+    )
 
 goal.issue().sync()
 ```
@@ -75,12 +78,6 @@ goal.args
 parallax examples/basic.py --dry-run
 ```
 
-指定日志根目录：
-
-```bash
-parallax examples/basic.py --root workspace/log_root
-```
-
 配置文件可以声明为可执行文件：
 
 ```python
@@ -92,40 +89,6 @@ parallax examples/basic.py --root workspace/log_root
 ```bash
 ./examples/basic.py
 ```
-
-## 调度接口
-
-`goal.schd()` 用于注册命令。注册操作不会立即启动命令：
-
-```python
-goal.schd("make test", threads=1)
-```
-
-`goal.issue()` 用于提交当前已经注册的命令，并返回任务组句柄：
-
-```python
-handle = goal.issue()
-handle.sync()
-```
-
-`goal.run()` 用于立即提交一个非阻塞命令，并返回命令句柄：
-
-```python
-handle = goal.run("echo immediate")
-handle.sync()
-```
-
-也可以直接通过指定 Runner 提交命令：
-
-```python
-local = goal.local(name="local", workspace="workspace/local")
-goal.setRunner(local)
-
-local.schd("echo scheduled on local")
-local.run("echo immediate on local").sync()
-```
-
-配置文件退出时，如果仍存在已经注册但尚未提交的命令，Parallax 会在结束前自动提交并等待这些命令完成。
 
 ## Runner
 
@@ -154,11 +117,132 @@ server = goal.ssh(
 goal.setRunner([local, server])
 ```
 
-`workspace` 表示 Runner 侧的命令工作目录根路径。日志始终写入调度侧的 `goal.root_path`。全局并行度由 `goal.setParallel(n)` 控制，单个 Runner 的并行度由 `max_jobs` 控制。
+`workspace` 表示 Runner 侧的输出根目录。未显式指定 `workspace` 时，默认使用：
+
+```text
+~/parallax
+```
+
+指定 `work_relpath` 时，每个命令的工作目录为：
+
+```text
+<runner.workspace>/<work-relpath>/
+```
+
+未指定 `work_relpath` 时，Parallax 会使用默认路径：
+
+```text
+<runner.workspace>/<auto-work-relpath>/
+```
+
+默认工作路径在任务提交时按递增编号生成，并保证同一次运行内唯一。该编号属于内部调度细节，配置文件需要读取输出位置时应使用句柄或执行结果中的 `work_relpath`、`work_dir`、`stdout_path` 和 `stderr_path`。全局并行度由 `goal.setParallel(n)` 控制，单个 Runner 的并行度由 `max_jobs` 控制。
+
+## 调度接口
+
+`goal.schd()` 用于注册命令。注册操作不会立即启动命令：
+
+```python
+goal.schd("make test", threads=1)
+```
+
+`goal.issue()` 用于提交当前已经注册的命令，并返回任务组句柄：
+
+```python
+handle = goal.issue()
+handle.sync()
+```
+
+`goal.run()` 用于立即提交一个非阻塞命令，并返回命令句柄：
+
+```python
+handle = goal.run("echo immediate")
+handle.sync()
+```
+
+需要固定 Runner 时，可以在 `goal.schd()` 中显式指定 `runner`：
+
+```python
+local = goal.local(name="local", workspace="workspace/local")
+goal.setRunner(local)
+
+goal.schd("echo scheduled on local", runner=local)
+goal.issue().sync()
+```
+
+Runner 实例也提供 `run()`，用于立即提交到指定 Runner：
+
+```python
+local.run("echo immediate on local").sync()
+```
+
+配置文件退出时，如果仍存在已经注册但尚未提交的命令，Parallax 会在结束前自动提交并等待这些命令完成。
+
+## Handle
+
+`goal.run()` 和 Runner 实例的 `run()` 返回单命令句柄，`goal.issue()` 返回任务组句柄。单命令句柄在命令被调度后会记录分配结果：
+
+```python
+handle = goal.run("echo runner=$PARALLAX_RUNNER")
+
+result = handle.sync()
+print(handle.runner_name)
+print(handle.work_dir)
+print(result.stdout_path)
+```
+
+单命令句柄和执行结果包含以下信息：
+
+```text
+command
+runner / runner_name
+work_relpath
+work_dir
+command_path
+stdout_path
+stderr_path
+cores
+numa_node
+```
+
+## Runner 状态
+
+Runner 提供运行时状态查询接口，可用于配置文件内部的调度决策：
+
+```python
+status = local.status()
+
+print(status.active_jobs)
+print(status.available_jobs)
+print(status.logical_core_count)
+print(status.configured_cores)
+print(status.available_cores)
+print(status.available_core_count)
+```
+
+常用快捷接口：
+
+```python
+local.active_jobs()
+local.available_jobs()
+local.logical_core_count()
+local.configured_cores()
+local.configured_core_count()
+local.available_cores()
+local.available_core_count()
+```
+
+也可以通过 `goal.runner_status()` 查询所有 Runner 或指定 Runner 的状态：
+
+```python
+all_status = goal.runner_status()
+one_status = goal.runner_status(local)
+```
+
+`logical_core_count` 表示 Runner 已知的总逻辑线程数。`configured_cores` 表示由 Parallax 管理、可用于核心绑定的核心集合。`available_cores` 表示当前尚未被 Parallax 任务租用的 `configured_cores` 子集，不表示操作系统层面的 CPU 空闲率。未声明 `core_pool` 或 `numa_nodes` 时，`configured_cores` 和 `available_cores` 为空列表。
 
 ## 命令选项
 
-`goal.schd()`、`goal.run()`、`runner.schd()` 和 `runner.run()` 支持相同的命令选项：
+`goal.schd()`、`goal.run()` 和 Runner 实例的 `run()` 支持相同的命令选项：
 
 ```python
 goal.schd(
@@ -178,11 +262,29 @@ goal.schd(
 命令运行时会注入以下环境变量：
 
 ```text
-PARALLAX_RUN_ID
 PARALLAX_RUNNER
 PARALLAX_WORK_RELPATH
 PARALLAX_WORK_DIR
-PARALLAX_LOG_DIR
+```
+
+## 输出文件
+
+每个命令的输出文件写入该命令的工作目录：
+
+```text
+<runner.workspace>/<work-relpath>/
+  command.txt
+  stdout.txt
+  stderr.txt
+```
+
+未显式指定 `work_relpath` 时，输出文件写入默认工作目录：
+
+```text
+<runner.workspace>/<auto-work-relpath>/
+  command.txt
+  stdout.txt
+  stderr.txt
 ```
 
 ## NUMA
@@ -197,8 +299,14 @@ local = goal.local(
 )
 goal.setRunner(local)
 
-for _ in range(2):
-    local.schd("echo runner=$PARALLAX_RUNNER", threads=1, numa_node=0)
+for index in range(2):
+    goal.schd(
+        "echo runner=$PARALLAX_RUNNER",
+        runner=local,
+        threads=1,
+        numa_node=0,
+        work_relpath=f"numa/{index}",
+    )
 
 goal.issue().sync()
 ```
@@ -229,26 +337,6 @@ goal.issue().sync()
 ```
 
 例如输入路径为 `a/b/c/d` 且 `levels=3` 时，`workload.relpath` 为 `b/c/d`。
-
-## 日志
-
-日志写入 `goal.root_path` 指定的根目录：
-
-```text
-<root-path>/
-  <work-relpath>/
-    command.txt
-    stdout.log
-    stderr.log
-```
-
-默认日志根目录为 `workspace/log_root`。配置文件可以设置默认日志根目录：
-
-```python
-goal.setRoot("workspace/log_root")
-```
-
-命令行参数 `--root` 的优先级高于 `goal.setRoot()`。
 
 ## 文件结构
 
