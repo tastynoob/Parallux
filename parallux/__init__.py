@@ -28,7 +28,7 @@ from ._core import (
 )
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 DEFAULT_WORKSPACE = "~/parallux"
 _NAME_RE = _re.compile(r"[^A-Za-z0-9_.-]+")
 
