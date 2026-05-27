@@ -1,6 +1,5 @@
-def build_print_task(name, message):
-    def task():
-        print(f"{name}: {message}")
+import shlex
 
-    task.__name__ = name
-    return task
+
+def build_print_command(name, message):
+    return "printf '%s\\n' " + shlex.quote(f"{name}: {message}")

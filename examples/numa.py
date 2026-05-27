@@ -1,4 +1,6 @@
-from parallax import goal, runner
+#!/usr/bin/env parallax
+
+from parallax import goal
 
 
 local = goal.local(
@@ -11,9 +13,7 @@ goal.setRunner(local)
 goal.setParallel(2)
 
 
-def task_with_numa():
-    runner.run("echo runner=$USER", num_cores=1, numa_node=0)
+for _ in range(2):
+    local.schd("echo runner=$USER", threads=1, numa_node=0)
 
-
-goal.addTask([task_with_numa] * 2)
-goal.issue(root_path="workspace/log_root")
+goal.issue().sync()
