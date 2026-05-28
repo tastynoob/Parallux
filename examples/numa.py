@@ -16,7 +16,6 @@ goal.setParallel(2)
 for index in range(2):
     goal.schd(
         "echo runner=$USER",
-        runner=local,
         threads=1,
         numa_node=0,
         work_relpath=f"numa/{index}",

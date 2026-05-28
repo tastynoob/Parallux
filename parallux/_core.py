@@ -182,7 +182,7 @@ class RunnerSpec:
         check: bool = True,
         timeout: float | None = None,
     ) -> Any:
-        return self._bound_goal().run(
+        return self._bound_goal()._run_on_runner(
             command,
             runner=self,
             name=name,
@@ -308,7 +308,6 @@ class Goal:
         self,
         command: str,
         *,
-        runner: RunnerSpec | None = None,
         name: str | None = None,
         threads: int = 0,
         thread: int | None = None,
@@ -322,7 +321,7 @@ class Goal:
     ) -> CommandSpec:
         spec = self._make_command(
             command,
-            runner=runner,
+            runner=None,
             name=name,
             threads=threads,
             thread=thread,
@@ -341,7 +340,38 @@ class Goal:
         self,
         command: str,
         *,
-        runner: RunnerSpec | None = None,
+        name: str | None = None,
+        threads: int = 0,
+        thread: int | None = None,
+        numa_node: int | None = None,
+        cores: Sequence[int] | None = None,
+        env: Mapping[str, Any] | None = None,
+        cwd: str | None = None,
+        work_relpath: str | None = None,
+        check: bool = True,
+        timeout: float | None = None,
+    ) -> Any:
+        spec = self._make_command(
+            command,
+            runner=None,
+            name=name,
+            threads=threads,
+            thread=thread,
+            numa_node=numa_node,
+            cores=cores,
+            env=env,
+            cwd=cwd,
+            work_relpath=work_relpath,
+            check=check,
+            timeout=timeout,
+        )
+        return self._runtime_required().submit(spec)
+
+    def _run_on_runner(
+        self,
+        command: str,
+        *,
+        runner: RunnerSpec,
         name: str | None = None,
         threads: int = 0,
         thread: int | None = None,

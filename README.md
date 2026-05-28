@@ -159,19 +159,12 @@ handle = goal.run("echo immediate")
 handle.sync()
 ```
 
-需要固定 Runner 时，可以在 `goal.schd()` 中显式指定 `runner`：
+`goal.schd()` 和 `goal.run()` 始终由全局调度器选择 Runner。需要固定 Runner 时，应直接使用 Runner 实例的 `run()`：
 
 ```python
 local = goal.local(name="local", workspace="workspace/local")
 goal.setRunner(local)
 
-goal.schd("echo scheduled on local", runner=local)
-goal.issue().sync()
-```
-
-Runner 实例也提供 `run()`，用于立即提交到指定 Runner：
-
-```python
 local.run("echo immediate on local").sync()
 ```
 
@@ -302,7 +295,6 @@ goal.setRunner(local)
 for index in range(2):
     goal.schd(
         "echo runner=$PARALLUX_RUNNER",
-        runner=local,
         threads=1,
         numa_node=0,
         work_relpath=f"numa/{index}",

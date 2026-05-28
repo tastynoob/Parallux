@@ -6,6 +6,7 @@ import os
 import re as _re
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import threading
@@ -230,7 +231,6 @@ class GoalShell(Protocol):
         self,
         command: str,
         *,
-        runner: RunnerSpec | None = None,
         name: str | None = None,
         threads: int = 0,
         thread: int | None = None,
@@ -247,7 +247,6 @@ class GoalShell(Protocol):
         self,
         command: str,
         *,
-        runner: RunnerSpec | None = None,
         name: str | None = None,
         threads: int = 0,
         thread: int | None = None,
@@ -398,7 +397,7 @@ class GroupHandle:
         for handle in self.handles:
             try:
                 results.append(handle.sync(timeout=timeout))
-            except BaseException as err:
+            except Exception as err:
                 errors.append(err)
         if errors:
             messages: list[str] = []
@@ -650,10 +649,28 @@ class Runtime:
         if self.goal.has_scheduled():
             self.goal.issue()
         GroupHandle(self.handles).sync()
+        self.shutdown()
+
+    def shutdown(self, *, cancel: bool = False) -> None:
+        running_to_stop: list[RunningCommand] = []
         with self.condition:
+            if cancel:
+                for pending in self.pending:
+                    pending.future.set_exception(ParalluxError("task cancelled"))
+                self.pending.clear()
+                running_to_stop = list(self.running)
+                self.running.clear()
+                for running in running_to_stop:
+                    self.runner_active[running.runner.name] -= 1
+                    running.lease.release()
+                    if not running.future.done():
+                        running.future.set_exception(ParalluxError("task cancelled"))
             self.stopping = True
             self.condition.notify_all()
-        self.thread.join()
+        if running_to_stop:
+            self._terminate_running_commands(running_to_stop)
+        if self.thread.is_alive() and threading.current_thread() is not self.thread:
+            self.thread.join()
 
     def _run_loop(self) -> None:
         while True:
@@ -825,6 +842,7 @@ class Runtime:
             stderr=stderr if stderr is not None else subprocess.DEVNULL,
             env=launch.env,
             cwd=launch.cwd,
+            start_new_session=True,
         )
         return RunningCommand(
             spec=pending.spec,
@@ -851,7 +869,7 @@ class Runtime:
                 and now - running.started_at >= running.spec.timeout
             )
             if timed_out and running.process.poll() is None:
-                running.process.kill()
+                self._signal_process(running.process, signal.SIGKILL)
                 if running.stderr is not None:
                     running.stderr.write(
                         f"parallux: command timed out after {running.spec.timeout}s\n".encode(
@@ -1071,6 +1089,50 @@ class Runtime:
     def _default_work_relpath(self, spec: _CommandSpec) -> str:
         return self._task_id_text(spec)
 
+    def _terminate_running_commands(self, running_commands: Sequence[RunningCommand]) -> None:
+        for running in running_commands:
+            if running.stderr is not None:
+                running.stderr.write(b"parallux: interrupted\n")
+                running.stderr.flush()
+            self._signal_process(running.process, signal.SIGTERM)
+
+        deadline = time.time() + 2.0
+        still_running: list[RunningCommand] = []
+        for running in running_commands:
+            timeout = max(0.0, deadline - time.time())
+            try:
+                running.process.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                still_running.append(running)
+
+        for running in still_running:
+            self._signal_process(running.process, signal.SIGKILL)
+        for running in still_running:
+            try:
+                running.process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                pass
+
+        for running in running_commands:
+            if running.stdout is not None:
+                running.stdout.close()
+            if running.stderr is not None:
+                running.stderr.close()
+
+    @staticmethod
+    def _signal_process(process: subprocess.Popen[bytes], sig: int) -> None:
+        if process.poll() is not None:
+            return
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            return
+        except OSError:
+            try:
+                process.send_signal(sig)
+            except ProcessLookupError:
+                return
+
     @staticmethod
     def _report_command_failure(
         *,
@@ -1159,11 +1221,9 @@ def run_runtime(argv: Sequence[str]) -> int:
     try:
         execute_config(config_path, goal=real_goal)
         runtime.finalize()
-    finally:
-        with runtime.condition:
-            runtime.stopping = True
-            runtime.condition.notify_all()
-        runtime.thread.join()
+    except BaseException:
+        runtime.shutdown(cancel=True)
+        raise
     return 0
 
 
