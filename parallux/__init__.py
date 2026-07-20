@@ -29,7 +29,7 @@ from ._core import (
 )
 
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 DEFAULT_WORKSPACE = "~/parallux"
 _NAME_RE = _re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -110,19 +110,10 @@ def workloads(
     return result
 
 
-class RunnerSpec(Protocol):
+class Runner(Protocol):
+    """Runner handle returned by goal.local() and goal.ssh()."""
+
     name: str
-    kind: str
-    host: str | None
-    user: str | None
-    port: int
-    workspace: str | None
-    shell: str
-    max_jobs: int | None
-    env: dict[str, str]
-    core_pool: list[int]
-    numa_nodes: dict[int, list[int]]
-    ssh_options: list[str]
 
     def status(self, *, numa_node: int | None = None) -> RunnerStatus: ...
 
@@ -171,7 +162,7 @@ class RunnerSpec(Protocol):
 
 class Handle(Protocol):
     command: str
-    runner: RunnerSpec | None
+    runner: Runner | None
     runner_name: str | None
     work_relpath: str | None
     work_dir: str | None
@@ -203,7 +194,7 @@ class GoalShell(Protocol):
         env: Mapping[str, str] | None = None,
         core_pool: Iterable[int] | None = None,
         numa_nodes: Mapping[int, Iterable[int]] | None = None,
-    ) -> RunnerSpec: ...
+    ) -> Runner: ...
 
     def ssh(
         self,
@@ -219,9 +210,9 @@ class GoalShell(Protocol):
         core_pool: Iterable[int] | None = None,
         numa_nodes: Mapping[int, Iterable[int]] | None = None,
         ssh_options: Sequence[str] | None = None,
-    ) -> RunnerSpec: ...
+    ) -> Runner: ...
 
-    def setRunner(self, runners: str | RunnerSpec | Sequence[str | RunnerSpec]) -> None: ...
+    def setRunner(self, runners: str | Runner | Sequence[str | Runner]) -> None: ...
 
     def setParallel(self, parallel: int) -> None: ...
 
@@ -263,7 +254,7 @@ class GoalShell(Protocol):
 
     def runner_status(
         self,
-        runner: RunnerSpec | None = None,
+        runner: Runner | None = None,
         *,
         numa_node: int | None = None,
     ) -> RunnerStatus | list[RunnerStatus]: ...
@@ -836,14 +827,22 @@ class Runtime:
             )
             pending.future.set_result(result)
             return None
-        process = subprocess.Popen(
-            launch.argv,
-            stdout=stdout if stdout is not None else subprocess.DEVNULL,
-            stderr=stderr if stderr is not None else subprocess.DEVNULL,
-            env=launch.env,
-            cwd=launch.cwd,
-            start_new_session=True,
-        )
+        try:
+            process = subprocess.Popen(
+                launch.argv,
+                stdout=stdout if stdout is not None else subprocess.DEVNULL,
+                stderr=stderr if stderr is not None else subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL if launch.runner.kind == "ssh" else None,
+                env=launch.env,
+                cwd=launch.cwd,
+                start_new_session=True,
+            )
+        except BaseException:
+            if stdout is not None:
+                stdout.close()
+            if stderr is not None:
+                stderr.close()
+            raise
         return RunningCommand(
             spec=pending.spec,
             runner=launch.runner,
@@ -944,6 +943,52 @@ class Runtime:
     def _allocator(self, runner: _RuntimeRunnerSpec) -> CoreAllocator:
         self._ensure_runner(runner)
         return self.allocators[runner.name]
+
+    def check_ssh_runner(self, runner: _RuntimeRunnerSpec) -> None:
+        runner.bind(self.goal).validate()
+        if runner.kind != "ssh":
+            return
+        argv = [
+            "ssh",
+            *runner.ssh_options,
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-p",
+            str(runner.port),
+            runner.target,
+            runner.shell,
+            "-lc",
+            "true",
+        ]
+        try:
+            result = subprocess.run(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                timeout=12.0,
+                check=False,
+                start_new_session=True,
+            )
+        except subprocess.TimeoutExpired as err:
+            raise ParalluxError(
+                f"ssh runner unavailable: runner={runner.name}; "
+                f"target={runner.target}; error=timeout after {err.timeout}s"
+            ) from err
+        except OSError as err:
+            raise ParalluxError(
+                f"ssh runner unavailable: runner={runner.name}; "
+                f"target={runner.target}; error={type(err).__name__}: {err}"
+            ) from err
+        if result.returncode != 0:
+            diagnostic = self._format_process_output(result.stderr, result.stdout)
+            raise ParalluxError(
+                f"ssh runner unavailable: runner={runner.name}; "
+                f"target={runner.target}; returncode={result.returncode}; "
+                f"error={diagnostic}"
+            )
 
     def runner_status(
         self,
@@ -1119,6 +1164,15 @@ class Runtime:
             if running.stderr is not None:
                 running.stderr.close()
 
+    @classmethod
+    def _format_process_output(cls, stderr: bytes, stdout: bytes = b"") -> str:
+        text = stderr.decode("utf-8", errors="replace").strip()
+        if not text:
+            text = stdout.decode("utf-8", errors="replace").strip()
+        if not text:
+            return "no ssh diagnostic output"
+        return cls._one_line(text)
+
     @staticmethod
     def _signal_process(process: subprocess.Popen[bytes], sig: int) -> None:
         if process.poll() is not None:
@@ -1145,6 +1199,13 @@ class Runtime:
             file=sys.stderr,
             flush=True,
         )
+
+    @staticmethod
+    def _one_line(text: str) -> str:
+        one_line = " | ".join(line.strip() for line in text.splitlines() if line.strip())
+        if len(one_line) > 500:
+            one_line = one_line[:497] + "..."
+        return one_line
 
     @staticmethod
     def _report_task_dispatch_failure(
@@ -1243,7 +1304,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 __all__ = [
     "GoalShell",
     "Handle",
-    "RunnerSpec",
+    "Runner",
     "RunnerStatus",
     "Workload",
     "goal",

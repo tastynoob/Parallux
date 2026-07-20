@@ -117,6 +117,8 @@ server = goal.ssh(
 goal.setRunner([local, server])
 ```
 
+`goal.setRunner("name")` 会优先引用已经创建过的 Runner；如果没有同名 Runner，会按 SSH host 通过 `goal.ssh(name, host=name)` 创建。创建 SSH Runner 时会立即检测连接和免密登录是否可用，检测失败会在配置阶段停止并输出 SSH 客户端诊断；远端命令自身的 stdout/stderr 仍写入工作目录。
+
 `workspace` 表示 Runner 侧的输出根目录。未显式指定 `workspace` 时，默认使用：
 
 ```text

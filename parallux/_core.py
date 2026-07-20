@@ -212,12 +212,13 @@ class Goal:
     ) -> None:
         self.mode = mode
         self.options = options
+        self._runtime: Any | None = None
+        self._runner_registry: dict[str, RunnerSpec] = {}
         self.runners: list[RunnerSpec] = [self.local("local")]
         self.env: dict[str, str] = {}
         self.parallel = 1
         self.argv = list(options.argv if options else [])
         self.args = dict(options.args if options else {})
-        self._runtime: Any | None = None
         self._scheduled: list[CommandSpec] = []
         self._command_index = 0
 
@@ -235,7 +236,7 @@ class Goal:
         core_pool: Iterable[int] | None = None,
         numa_nodes: Mapping[int, Iterable[int]] | None = None,
     ) -> RunnerSpec:
-        return RunnerSpec(
+        spec = RunnerSpec(
             name=name,
             kind="local",
             workspace=workspace,
@@ -245,6 +246,9 @@ class Goal:
             core_pool=list(core_pool or []),
             numa_nodes={int(k): list(v) for k, v in dict(numa_nodes or {}).items()},
         ).bind(self)
+        spec.validate()
+        self._register_runner(spec)
+        return spec
 
     def ssh(
         self,
@@ -261,7 +265,7 @@ class Goal:
         numa_nodes: Mapping[int, Iterable[int]] | None = None,
         ssh_options: Sequence[str] | None = None,
     ) -> RunnerSpec:
-        return RunnerSpec(
+        spec = RunnerSpec(
             name=name,
             kind="ssh",
             host=host or name,
@@ -275,6 +279,11 @@ class Goal:
             numa_nodes={int(k): list(v) for k, v in dict(numa_nodes or {}).items()},
             ssh_options=list(ssh_options or []),
         ).bind(self)
+        spec.validate()
+        if self._runtime is not None:
+            self._runtime.check_ssh_runner(spec)
+        self._register_runner(spec)
+        return spec
 
     def setRunner(self, runners: str | RunnerSpec | Sequence[str | RunnerSpec]) -> None:
         values = [runners] if isinstance(runners, (str, RunnerSpec)) else list(runners)
@@ -284,15 +293,19 @@ class Goal:
         for item in values:
             if isinstance(item, RunnerSpec):
                 spec = item.bind(self)
-            elif item == "local":
-                spec = self.local("local")
             elif isinstance(item, str):
-                spec = self.ssh(item, host=item)
+                spec = self._runner_registry.get(item)
+                if spec is None:
+                    spec = self.ssh(item, host=item)
             else:
                 raise ParalluxError(f"unsupported runner value: {item!r}")
             spec.validate()
+            self._register_runner(spec)
             parsed.append(spec)
         self.runners = parsed
+
+    def _register_runner(self, runner: RunnerSpec) -> None:
+        self._runner_registry[runner.name] = runner.bind(self)
 
     def setParallel(self, parallel: int) -> None:
         if parallel <= 0:
