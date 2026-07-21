@@ -8,7 +8,7 @@ import threading
 from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Protocol, Sequence
 
 
 from ._core import (
@@ -18,6 +18,7 @@ from ._core import (
     RunnerSpec as _RuntimeRunnerSpec,
     RunnerStatus,
     RuntimeOptions as _RuntimeOptions,
+    SchedulerSelector as _RuntimeSchedulerSelector,
     execute_config,
 )
 from ._process import (
@@ -32,7 +33,7 @@ from ._process import (
     SSHTransportFailure,
     TaskDispatchFailure,
 )
-from ._scheduler import DefaultScheduler, SchedulerAssignment
+from ._scheduler import TaskAllocation, TaskAllocator, default_allocate_runner
 
 
 __version__ = "0.1.3"
@@ -223,6 +224,11 @@ class GoalShell(Protocol):
 
     def setEnv(self, key: str, value: Any) -> None: ...
 
+    def setScheduler(
+        self,
+        scheduler: Callable[[list[Runner], int], Runner | None],
+    ) -> None: ...
+
     def schd(
         self,
         command: str,
@@ -393,7 +399,7 @@ class PendingCommand:
 
 @dataclass
 class ScheduledProcess:
-    assignment: SchedulerAssignment
+    allocation: TaskAllocation
     plan: ProcessPlan
 
 
@@ -401,7 +407,7 @@ class ScheduledProcess:
 class RunningCommand:
     future: Future[CommandResult]
     handle: Handle
-    assignment: SchedulerAssignment
+    allocation: TaskAllocation
     active: ActiveProcess
 
 
@@ -413,7 +419,10 @@ class Runtime:
         self.pending: list[PendingCommand] = []
         self.running: list[RunningCommand] = []
         self.handles: list[Handle] = []
-        self.scheduler = DefaultScheduler(goal)
+        self.scheduler: _RuntimeSchedulerSelector = (
+            goal.scheduler or default_allocate_runner
+        )
+        self.allocator = TaskAllocator(goal)
         self.executor = ProcessExecutor(goal, options)
         self._next_task_id = 1
         self.stopping = False
@@ -432,6 +441,16 @@ class Runtime:
 
     def submit_many(self, specs: Sequence[_CommandSpec]) -> GroupHandle:
         return GroupHandle([self.submit(spec) for spec in specs])
+
+    def set_scheduler(self, scheduler: _RuntimeSchedulerSelector) -> None:
+        with self.condition:
+            self.scheduler = scheduler
+            self.condition.notify_all()
+
+    def set_scheduler_runners(self, runners: Sequence[_RuntimeRunnerSpec]) -> None:
+        with self.condition:
+            self.allocator.set_runners(runners)
+            self.condition.notify_all()
 
     def _assign_task_id_locked(self, spec: _CommandSpec) -> None:
         if spec._task_id is not None:
@@ -455,7 +474,7 @@ class Runtime:
                 running_to_stop = list(self.running)
                 self.running.clear()
                 for running in running_to_stop:
-                    self.scheduler.release_started(running.assignment)
+                    self.allocator.release_started(running.allocation)
                     if not running.future.done():
                         running.future.set_exception(ParalluxError("task cancelled"))
             self.stopping = True
@@ -498,24 +517,24 @@ class Runtime:
                 try:
                     started_process = self.executor.start(scheduled.plan)
                 except BaseException as err:
-                    self.scheduler.release_unstarted(scheduled.assignment)
+                    self.allocator.release_unstarted(scheduled.allocation)
                     pending.future.set_exception(
                         self._task_dispatch_failure(err, paths=scheduled.plan.paths)
                     )
                     started = True
                     break
                 if isinstance(started_process, ActiveProcess):
-                    self.scheduler.mark_started(scheduled.assignment)
+                    self.allocator.mark_started(scheduled.allocation)
                     self.running.append(
                         RunningCommand(
                             future=pending.future,
                             handle=pending.handle,
-                            assignment=scheduled.assignment,
+                            allocation=scheduled.allocation,
                             active=started_process,
                         )
                     )
                 else:
-                    self.scheduler.release_unstarted(scheduled.assignment)
+                    self.allocator.release_unstarted(scheduled.allocation)
                     self._complete_future(pending.future, started_process)
                 started = True
                 break
@@ -524,36 +543,40 @@ class Runtime:
         self,
         spec: _CommandSpec,
     ) -> ScheduledProcess | None:
-        assignment = self.scheduler.try_assign(spec, running_count=len(self.running))
-        if assignment is None:
+        allocation = self.allocator.try_allocate(
+            spec,
+            scheduler=self.scheduler,
+            running_count=len(self.running),
+        )
+        if allocation is None:
             return None
         paths: CommandPaths | None = None
         try:
             paths = self.executor.paths(
                 spec,
-                assignment.runner,
+                allocation.runner,
                 default_work_relpath=self._default_work_relpath(spec),
             )
-            full_command = assignment.lease.wrap(spec.command, assignment.runner.shell)
+            full_command = allocation.lease.wrap(spec.command, allocation.runner.shell)
             plan = self.executor.plan(
                 spec,
-                assignment.runner,
+                allocation.runner,
                 paths=paths,
                 full_command=full_command,
-                cores=assignment.lease.cores,
-                numa_node=assignment.lease.mem_node,
+                cores=allocation.lease.cores,
+                numa_node=allocation.lease.mem_node,
             )
         except BaseException as err:
-            self.scheduler.release_unstarted(assignment)
+            self.allocator.release_unstarted(allocation)
             raise self._task_dispatch_failure(err, paths=paths) from err
-        return ScheduledProcess(assignment=assignment, plan=plan)
+        return ScheduledProcess(allocation=allocation, plan=plan)
 
     @staticmethod
     def _assign_handle(handle: Handle, scheduled: ScheduledProcess) -> None:
         paths = scheduled.plan.paths
-        lease = scheduled.assignment.lease
+        lease = scheduled.allocation.lease
         handle._assign(
-            runner=scheduled.assignment.runner,
+            runner=scheduled.allocation.runner,
             work_relpath=paths.work_relpath,
             work_dir=paths.work_dir,
             command_path=paths.command_path,
@@ -569,7 +592,7 @@ class Runtime:
             if completion is None:
                 continue
             self.running.remove(running)
-            self.scheduler.release_started(running.assignment)
+            self.allocator.release_started(running.allocation)
             self._complete_future(running.future, completion)
             self.condition.notify_all()
         return 0.05
@@ -619,7 +642,7 @@ class Runtime:
         numa_node: int | None = None,
     ) -> RunnerStatus:
         with self.condition:
-            return self.scheduler.runner_status(runner, numa_node=numa_node)
+            return self.allocator.runner_status(runner, numa_node=numa_node)
 
     def _default_work_relpath(self, spec: _CommandSpec) -> str:
         return self._task_id_text(spec)

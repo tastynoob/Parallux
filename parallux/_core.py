@@ -5,7 +5,7 @@ import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 _NAME_RE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -203,6 +203,15 @@ class RunnerSpec:
         return self._goal
 
 
+SchedulerSelector = Callable[[list[RunnerSpec], int], RunnerSpec | None]
+
+
+def _normalize_scheduler(scheduler: Any) -> SchedulerSelector:
+    if not callable(scheduler):
+        raise ParalluxError("goal.setScheduler() needs a callable")
+    return scheduler
+
+
 class Goal:
     def __init__(
         self,
@@ -217,6 +226,7 @@ class Goal:
         self.runners: list[RunnerSpec] = [self.local("local")]
         self.env: dict[str, str] = {}
         self.parallel = 1
+        self.scheduler: SchedulerSelector | None = None
         self.argv = list(options.argv if options else [])
         self.args = dict(options.args if options else {})
         self._scheduled: list[CommandSpec] = []
@@ -303,6 +313,8 @@ class Goal:
             self._register_runner(spec)
             parsed.append(spec)
         self.runners = parsed
+        if self._runtime is not None:
+            self._runtime.set_scheduler_runners(parsed)
 
     def _register_runner(self, runner: RunnerSpec) -> None:
         self._runner_registry[runner.name] = runner.bind(self)
@@ -316,6 +328,11 @@ class Goal:
         if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key):
             raise ParalluxError(f"invalid environment variable name: {key!r}")
         self.env[key] = str(value)
+
+    def setScheduler(self, scheduler: SchedulerSelector) -> None:
+        self.scheduler = _normalize_scheduler(scheduler)
+        if self._runtime is not None:
+            self._runtime.set_scheduler(self.scheduler)
 
     def schd(
         self,

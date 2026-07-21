@@ -4,7 +4,14 @@ import os
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from ._core import CommandSpec, ParalluxError, RunnerSpec, RunnerStatus, _shell_join
+from ._core import (
+    CommandSpec,
+    ParalluxError,
+    RunnerSpec,
+    RunnerStatus,
+    SchedulerSelector,
+    _shell_join,
+)
 
 
 def _format_cores(cores: Sequence[int]) -> str:
@@ -74,6 +81,40 @@ class CoreAllocator:
         mem_node = numa_node if numa_node is not None else self._infer_node(requested)
         return CoreLease(self, requested, mem_node)
 
+    def can_satisfy(
+        self,
+        *,
+        threads: int = 0,
+        numa_node: int | None = None,
+        cores: Sequence[int] | None = None,
+    ) -> bool:
+        if cores:
+            requested = [int(core) for core in cores]
+            return bool(self.pool) and set(requested).issubset(set(self.pool))
+        if threads > 0 and self.pool:
+            return len(set(self._candidate_pool(numa_node))) >= threads
+        if numa_node is not None and not self.pool:
+            return False
+        return True
+
+    def can_acquire(
+        self,
+        *,
+        threads: int = 0,
+        numa_node: int | None = None,
+        cores: Sequence[int] | None = None,
+    ) -> bool:
+        if not self.can_satisfy(threads=threads, numa_node=numa_node, cores=cores):
+            return False
+        if cores:
+            requested = [int(core) for core in cores]
+            return set(requested).issubset(self.available)
+        if threads > 0 and self.pool:
+            pool = self._candidate_pool(numa_node)
+            available = [core for core in pool if core in self.available]
+            return len(available) >= threads
+        return True
+
     def release(self, cores: Sequence[int]) -> None:
         if not cores or not self.pool:
             return
@@ -98,11 +139,6 @@ class CoreAllocator:
 
     def available_core_count(self, numa_node: int | None = None) -> int:
         return len(self.available_cores(numa_node))
-
-    def scheduling_core_score(self, numa_node: int | None = None) -> int:
-        if self.pool:
-            return self.available_core_count(numa_node)
-        return self.logical_core_count(numa_node)
 
     def _validate_exact(self, cores: Sequence[int]) -> None:
         if not self.pool:
@@ -150,54 +186,72 @@ class CoreAllocator:
 
 
 @dataclass
-class SchedulerAssignment:
+class TaskAllocation:
     runner: RunnerSpec
     lease: CoreLease
 
 
-class DefaultScheduler:
+def default_allocate_runner(runners: list[RunnerSpec], need_threads: int) -> RunnerSpec | None:
+    del need_threads
+    if not runners:
+        return None
+    return runners[0]
+
+
+class TaskAllocator:
     def __init__(self, goal: Any) -> None:
         self.goal = goal
+        self.runners = list(goal.runners)
         self.runner_active: dict[str, int] = {}
         self.allocators: dict[str, CoreAllocator] = {}
 
-    def try_assign(
+    def set_runners(self, runners: Sequence[RunnerSpec]) -> None:
+        self.runners = list(runners)
+
+    def try_allocate(
         self,
         spec: CommandSpec,
         *,
+        scheduler: SchedulerSelector,
         running_count: int,
-    ) -> SchedulerAssignment | None:
+    ) -> TaskAllocation | None:
         if running_count >= self.goal.parallel:
             return None
-        for runner in self._candidate_runners(spec):
-            if self.runner_active.get(runner.name, 0) >= self._max_jobs(runner):
-                continue
-            lease = self._allocator(runner).try_acquire(
-                threads=spec.threads,
-                numa_node=spec.numa_node,
-                cores=spec.cores,
-            )
-            if lease is None:
-                continue
-            return SchedulerAssignment(runner=runner, lease=lease)
-        return None
+        if spec.runner is not None:
+            runner = self._validate_runner(spec.runner)
+            if self._runner_can_allocate_now(runner, spec):
+                return self._allocate_on_runner(runner, spec)
+            if running_count == 0 and not self._runner_can_ever_allocate(runner, spec):
+                raise self._unschedulable_error(spec, runners=[runner])
+            return None
 
-    def mark_started(self, assignment: SchedulerAssignment) -> None:
-        name = assignment.runner.name
+        candidates = self._candidate_runners(spec)
+        if not candidates:
+            if running_count == 0:
+                raise self._unschedulable_error(spec, runners=self.runners)
+            return None
+
+        runner = scheduler(list(candidates), self._needed_threads(spec))
+        if runner is None:
+            return None
+        runner = self._validate_scheduler_result(runner, candidates)
+        return self._allocate_on_runner(runner, spec)
+
+    def mark_started(self, allocation: TaskAllocation) -> None:
+        name = allocation.runner.name
         self.runner_active[name] = self.runner_active.get(name, 0) + 1
 
-    def release_started(self, assignment: SchedulerAssignment) -> None:
-        name = assignment.runner.name
+    def release_started(self, allocation: TaskAllocation) -> None:
+        name = allocation.runner.name
         self.runner_active[name] = self.runner_active.get(name, 0) - 1
-        assignment.lease.release()
+        allocation.lease.release()
 
-    def release_unstarted(self, assignment: SchedulerAssignment) -> None:
-        assignment.lease.release()
+    def release_unstarted(self, allocation: TaskAllocation) -> None:
+        allocation.lease.release()
 
     def runner_status(
         self,
         runner: RunnerSpec,
-        *,
         numa_node: int | None = None,
     ) -> RunnerStatus:
         self._ensure_runner(runner)
@@ -220,26 +274,6 @@ class DefaultScheduler:
             numa_node=numa_node,
         )
 
-    def _candidate_runners(self, spec: CommandSpec) -> list[RunnerSpec]:
-        if spec.runner is not None:
-            spec.runner.bind(self.goal).validate()
-            self._ensure_runner(spec.runner)
-            return [spec.runner]
-        if not self.goal.runners:
-            raise ParalluxError("no runner configured")
-        for runner in self.goal.runners:
-            self._ensure_runner(runner)
-        return sorted(
-            self.goal.runners,
-            key=lambda item: self._runner_sort_key(item, spec),
-        )
-
-    def _runner_sort_key(self, runner: RunnerSpec, spec: CommandSpec) -> tuple[float, int, int, str]:
-        active = self.runner_active.get(runner.name, 0)
-        max_jobs = self._max_jobs(runner)
-        core_score = self._allocator(runner).scheduling_core_score(spec.numa_node)
-        return active / float(max_jobs), active, -core_score, runner.name
-
     def _ensure_runner(self, runner: RunnerSpec) -> None:
         runner.bind(self.goal).validate()
         self.runner_active.setdefault(runner.name, 0)
@@ -251,3 +285,107 @@ class DefaultScheduler:
 
     def _max_jobs(self, runner: RunnerSpec) -> int:
         return runner.max_jobs or self.goal.parallel
+
+    def _candidate_runners(self, spec: CommandSpec) -> list[RunnerSpec]:
+        if not self.runners:
+            raise ParalluxError("no runner configured")
+        candidates = [
+            runner
+            for runner in (self._validate_runner(item) for item in self.runners)
+            if self._runner_can_allocate_now(runner, spec)
+        ]
+        return sorted(
+            candidates,
+            key=lambda runner: self._runner_sort_key(
+                self.runner_status(runner, spec.numa_node)
+            ),
+        )
+
+    def _runner_can_allocate_now(self, runner: RunnerSpec, spec: CommandSpec) -> bool:
+        self._ensure_runner(runner)
+        if self.runner_active.get(runner.name, 0) >= self._max_jobs(runner):
+            return False
+        return self._allocator(runner).can_acquire(
+            threads=spec.threads,
+            numa_node=spec.numa_node,
+            cores=spec.cores,
+        )
+
+    def _runner_can_ever_allocate(self, runner: RunnerSpec, spec: CommandSpec) -> bool:
+        self._ensure_runner(runner)
+        return self._allocator(runner).can_satisfy(
+            threads=spec.threads,
+            numa_node=spec.numa_node,
+            cores=spec.cores,
+        )
+
+    def _allocate_on_runner(
+        self,
+        runner: RunnerSpec,
+        spec: CommandSpec,
+    ) -> TaskAllocation | None:
+        lease = self._allocator(runner).try_acquire(
+            threads=spec.threads,
+            numa_node=spec.numa_node,
+            cores=spec.cores,
+        )
+        if lease is None:
+            return None
+        return TaskAllocation(runner=runner, lease=lease)
+
+    def _validate_runner(self, runner: RunnerSpec) -> RunnerSpec:
+        if not isinstance(runner, RunnerSpec):
+            raise ParalluxError(
+                "scheduler must return a Runner created by goal.local() or goal.ssh()"
+            )
+        runner.bind(self.goal).validate()
+        return runner
+
+    def _validate_scheduler_result(
+        self,
+        runner: RunnerSpec,
+        candidates: Sequence[RunnerSpec],
+    ) -> RunnerSpec:
+        runner = self._validate_runner(runner)
+        if not any(runner is candidate for candidate in candidates):
+            raise ParalluxError("scheduler must return one of the available runners")
+        return runner
+
+    def _unschedulable_error(
+        self,
+        spec: CommandSpec,
+        *,
+        runners: Sequence[RunnerSpec],
+    ) -> ParalluxError:
+        runner_names = ", ".join(runner.name for runner in runners) or "<none>"
+        if spec.cores is not None:
+            request = (
+                f"cores={list(spec.cores)}; "
+                f"need_threads={self._needed_threads(spec)}"
+            )
+        else:
+            request = f"threads={spec.threads}"
+        if spec.numa_node is not None:
+            request = f"{request}; numa_node={spec.numa_node}"
+        return ParalluxError(
+            f"no runner can satisfy task resource request: {request}; "
+            f"runners={runner_names}"
+        )
+
+    @staticmethod
+    def _runner_sort_key(status: RunnerStatus) -> tuple[float, int, int, str]:
+        core_score = status.available_core_count
+        if status.configured_core_count == 0:
+            core_score = status.logical_core_count
+        return (
+            status.active_jobs / float(status.max_jobs),
+            status.active_jobs,
+            -core_score,
+            status.name,
+        )
+
+    @staticmethod
+    def _needed_threads(spec: CommandSpec) -> int:
+        if spec.cores is not None:
+            return len(spec.cores)
+        return spec.threads

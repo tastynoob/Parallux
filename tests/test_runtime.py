@@ -156,6 +156,117 @@ class RuntimeTests(unittest.TestCase):
             stdout = (workspace / "cli" / "stdout.txt").read_text()
             self.assertIn("[dry-run] echo cli", stdout)
 
+    def test_scheduler_receives_available_runners(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            left_workspace = Path(tempdir) / "left"
+            right_workspace = Path(tempdir) / "right"
+            seen: list[tuple[list[str], int]] = []
+
+            with runtime_goal(Path(tempdir) / "config.py") as goal:
+                goal.local(
+                    "left",
+                    workspace=str(left_workspace),
+                    core_pool=range(0, 1),
+                )
+                goal.local(
+                    "right",
+                    workspace=str(right_workspace),
+                    core_pool=range(0, 4),
+                )
+                goal.setRunner(["left", "right"])
+
+                def allocate_runner(runners, need_threads: int):
+                    seen.append(([runner.name for runner in runners], need_threads))
+                    return runners[0]
+
+                goal.setScheduler(allocate_runner)
+
+                result = goal.run(
+                    "echo runner=$PARALLUX_RUNNER",
+                    threads=2,
+                    work_relpath="picked",
+                ).sync()
+
+            self.assertEqual(seen, [(["right"], 2)])
+            self.assertEqual(result.runner, "right")
+            self.assertEqual(result.cores, (0, 1))
+            self.assertEqual(result.work_dir, str(right_workspace / "picked"))
+            self.assertEqual(
+                (right_workspace / "picked" / "stdout.txt").read_text().strip(),
+                "runner=right",
+            )
+
+    def test_scheduler_cannot_return_runner_outside_available_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            left_workspace = Path(tempdir) / "left"
+            right_workspace = Path(tempdir) / "right"
+
+            with runtime_goal(Path(tempdir) / "config.py") as goal:
+                left = goal.local(
+                    "left",
+                    workspace=str(left_workspace),
+                    core_pool=range(0, 1),
+                )
+                goal.local(
+                    "right",
+                    workspace=str(right_workspace),
+                    core_pool=range(0, 4),
+                )
+                goal.setRunner(["left", "right"])
+                goal.setScheduler(lambda runners, need_threads: left)
+
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    with self.assertRaises(ParalluxError) as raised:
+                        goal.run("echo never", threads=2, work_relpath="invalid").sync()
+
+            self.assertIn(
+                "scheduler must return one of the available runners",
+                str(raised.exception),
+            )
+
+    def test_parallel_above_available_cores_waits_for_core_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            workspace = Path(tempdir) / "workspace"
+
+            with runtime_goal(Path(tempdir) / "config.py") as goal:
+                goal.setParallel(4)
+                goal.local("local", workspace=str(workspace), core_pool=range(0, 1))
+                goal.setRunner("local")
+
+                first = goal.run(
+                    "sleep 0.1; echo first",
+                    threads=1,
+                    work_relpath="first",
+                )
+                second = goal.run("echo second", threads=1, work_relpath="second")
+
+                first_result = first.sync(timeout=2)
+                second_result = second.sync(timeout=2)
+
+            self.assertEqual(first_result.cores, (0,))
+            self.assertEqual(second_result.cores, (0,))
+            self.assertEqual(
+                (workspace / "second" / "stdout.txt").read_text().strip(),
+                "second",
+            )
+
+    def test_unschedulable_thread_request_fails_instead_of_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            workspace = Path(tempdir) / "workspace"
+            with runtime_goal(Path(tempdir) / "config.py") as goal:
+                goal.local("local", workspace=str(workspace), core_pool=range(0, 1))
+                goal.setRunner("local")
+
+                stderr = io.StringIO()
+                with redirect_stderr(stderr):
+                    with self.assertRaises(ParalluxError) as raised:
+                        goal.run("echo never", threads=2, work_relpath="too-big").sync(
+                            timeout=1
+                        )
+
+            self.assertIn("no runner can satisfy", str(raised.exception))
+
     def test_fake_ssh_remote_success_and_command_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir, fake_ssh_env():
             workspace = Path(tempdir) / "remote"

@@ -141,6 +141,24 @@ goal.setRunner([local, server])
 
 ## 调度接口
 
+可以通过 `goal.setScheduler()` 提供一个函数式调度器。函数接收当前可分配的 Runner 列表和任务需要的线程数，返回选中的 Runner；返回 `None` 表示当前暂不分配：
+
+```python
+runner0 = goal.ssh("server0", workspace="workspace/server0", core_pool=range(0, 16))
+runner1 = goal.ssh("server1", workspace="workspace/server1", core_pool=range(0, 32))
+goal.setRunner([runner0, runner1])
+
+
+def allocate_runner(runners, need_threads):
+    runners.sort(key=lambda runner: runner.available_core_count(), reverse=True)
+    return runners[0] if runners else None
+
+
+goal.setScheduler(allocate_runner)
+```
+
+`setRunner()` 是 runner 池的唯一入口。用户调度函数只负责在 Parallux 传入的候选 Runner 里选择一个；Runner 并行度、核心 lease、NUMA 约束、进程启动和 SSH 回收仍由内部 allocator 处理。
+
 `goal.schd()` 用于注册命令。注册操作不会立即启动命令：
 
 ```python
