@@ -865,7 +865,7 @@ class Runtime:
                     if ssh_stderr is not None
                     else subprocess.DEVNULL
                 ),
-                stdin=subprocess.DEVNULL if launch.runner.kind == "ssh" else None,
+                stdin=subprocess.PIPE if launch.runner.kind == "ssh" else None,
                 env=launch.env,
                 cwd=launch.cwd,
                 start_new_session=True,
@@ -904,6 +904,7 @@ class Runtime:
                 and now - running.started_at >= running.spec.timeout
             )
             if timed_out and running.process.poll() is None:
+                self._close_process_stdin(running.process)
                 self._signal_process(running.process, signal.SIGKILL)
                 if running.stderr is not None:
                     running.stderr.write(
@@ -917,6 +918,7 @@ class Runtime:
             self.running.remove(running)
             self.runner_active[running.runner.name] -= 1
             running.lease.release()
+            self._close_process_stdin(running.process)
             ssh_stderr = self._read_and_close(running.ssh_stderr)
             if running.stdout is not None:
                 running.stdout.close()
@@ -934,7 +936,10 @@ class Runtime:
                 cores=tuple(running.lease.cores),
                 numa_node=running.lease.mem_node,
             )
-            if returncode != 0 and running.runner.kind == "ssh" and ssh_stderr:
+            if running.runner.kind == "ssh" and self._is_ssh_transport_failure(
+                returncode,
+                ssh_stderr,
+            ):
                 self._report_ssh_transport_failure(
                     runner=running.runner,
                     returncode=returncode,
@@ -1110,10 +1115,12 @@ class Runtime:
                     f"> {self._quote_remote_path(command_path)}"
                 ),
                 f"cd {self._quote_remote_path(remote_cwd)}",
-                (
-                    f"{{ {self._remote_shell_body(runner, env, full_command)}; }} "
-                    f"> {self._quote_remote_path(stdout_path)} "
-                    f"2> {self._quote_remote_path(stderr_path)}"
+                self._remote_watchdog_body(
+                    runner,
+                    env,
+                    full_command,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
                 ),
             ]
         )
@@ -1178,6 +1185,39 @@ class Runtime:
         )
         return f"{exports} exec {shlex.quote(runner.shell)} -lc {shlex.quote(command)}"
 
+    def _remote_watchdog_body(
+        self,
+        runner: _RuntimeRunnerSpec,
+        env: Mapping[str, str],
+        command: str,
+        *,
+        stdout_path: str,
+        stderr_path: str,
+    ) -> str:
+        command_body = self._remote_shell_body(runner, env, command)
+        stdout = self._quote_remote_path(stdout_path)
+        stderr = self._quote_remote_path(stderr_path)
+        return (
+            "{ "
+            "exec 3<&0; "
+            f"setsid {shlex.quote(runner.shell)} -lc {shlex.quote(command_body)} "
+            f"< /dev/null > {stdout} 2> {stderr} & "
+            "task_pid=$!; "
+            "( while IFS= read -r _; do :; done <&3; "
+            "kill -TERM -\"$task_pid\" 2>/dev/null || "
+            "kill -TERM \"$task_pid\" 2>/dev/null; "
+            "sleep 2; "
+            "kill -KILL -\"$task_pid\" 2>/dev/null || "
+            "kill -KILL \"$task_pid\" 2>/dev/null; "
+            ") & watchdog_pid=$!; "
+            "wait \"$task_pid\"; rc=$?; "
+            "kill \"$watchdog_pid\" 2>/dev/null; "
+            "wait \"$watchdog_pid\" 2>/dev/null; "
+            "exec 3<&-; "
+            "exit \"$rc\"; "
+            "}"
+        )
+
     @staticmethod
     def _valid_env_key(key: str) -> bool:
         return re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", key) is not None
@@ -1190,6 +1230,7 @@ class Runtime:
             if running.stderr is not None:
                 running.stderr.write(b"parallux: interrupted\n")
                 running.stderr.flush()
+            self._close_process_stdin(running.process)
             self._signal_process(running.process, signal.SIGTERM)
 
         deadline = time.time() + 2.0
@@ -1226,6 +1267,19 @@ class Runtime:
             return stream.read().decode("utf-8", errors="replace").strip()
         finally:
             stream.close()
+
+    @staticmethod
+    def _close_process_stdin(process: subprocess.Popen[bytes]) -> None:
+        if process.stdin is None or process.stdin.closed:
+            return
+        try:
+            process.stdin.close()
+        except OSError:
+            return
+
+    @staticmethod
+    def _is_ssh_transport_failure(returncode: int, diagnostic: str) -> bool:
+        return returncode < 0 or (returncode == 255 and bool(diagnostic))
 
     @classmethod
     def _format_process_output(cls, stderr: bytes, stdout: bytes = b"") -> str:
@@ -1271,12 +1325,13 @@ class Runtime:
         returncode: int,
         diagnostic: str,
     ) -> None:
+        one_line = Runtime._one_line(diagnostic) or "ssh process ended without diagnostic"
         print(
             (
                 "ssh transport failed: "
                 f"runner={runner.name}; target={runner.target}; "
                 f"returncode={returncode}; work_dir={work_dir}; "
-                f"error={Runtime._one_line(diagnostic)}"
+                f"error={one_line}"
             ),
             file=sys.stderr,
             flush=True,
