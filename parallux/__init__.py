@@ -36,7 +36,7 @@ from ._process import (
 from ._scheduler import TaskAllocation, TaskAllocator, default_allocate_runner
 
 
-__version__ = "0.1.3"
+__version__ = "0.2.0"
 _NAME_RE = _re.compile(r"[^A-Za-z0-9_.-]+")
 
 
