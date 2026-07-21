@@ -9,6 +9,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import Future
@@ -312,6 +313,20 @@ class CommandFailure(ParalluxError):
         super().__init__("command failed")
 
 
+class SSHTransportFailure(ParalluxError):
+    def __init__(
+        self,
+        *,
+        returncode: int,
+        work_dir: str,
+        diagnostic: str,
+    ) -> None:
+        self.returncode = returncode
+        self.work_dir = work_dir
+        self.diagnostic = diagnostic
+        super().__init__("ssh transport failed")
+
+
 class TaskDispatchFailure(ParalluxError):
     def __init__(
         self,
@@ -393,16 +408,22 @@ class GroupHandle:
         if errors:
             messages: list[str] = []
             command_errors = [err for err in errors if isinstance(err, CommandFailure)]
+            ssh_errors = [err for err in errors if isinstance(err, SSHTransportFailure)]
             dispatch_errors = [
                 err for err in errors if isinstance(err, TaskDispatchFailure)
             ]
             other_errors = [
                 err
                 for err in errors
-                if not isinstance(err, (CommandFailure, TaskDispatchFailure))
+                if not isinstance(
+                    err,
+                    (CommandFailure, SSHTransportFailure, TaskDispatchFailure),
+                )
             ]
             if command_errors:
                 messages.append(f"{len(command_errors)} command(s) failed")
+            if ssh_errors:
+                messages.append(f"{len(ssh_errors)} ssh transport failure(s)")
             if dispatch_errors:
                 messages.append(
                     f"{len(dispatch_errors)} task(s) failed before command execution"
@@ -593,6 +614,7 @@ class RunningCommand:
     handle: Handle
     stdout: BinaryIO | None
     stderr: BinaryIO | None
+    ssh_stderr: BinaryIO | None
     lease: CoreLease
     started_at: float
     work_relpath: str
@@ -798,6 +820,7 @@ class Runtime:
     ) -> RunningCommand | None:
         stdout: BinaryIO | None = None
         stderr: BinaryIO | None = None
+        ssh_stderr: BinaryIO | None = None
         if launch.local_artifacts:
             Path(launch.work_dir).mkdir(parents=True, exist_ok=True)
             with Path(launch.command_path).open("w", encoding="utf-8") as fs:
@@ -806,12 +829,16 @@ class Runtime:
                 fs.write(f"executor: {_shell_join(launch.argv)}\n")
             stdout = Path(launch.stdout_path).open("wb")
             stderr = Path(launch.stderr_path).open("wb")
+        elif launch.runner.kind == "ssh":
+            ssh_stderr = tempfile.TemporaryFile("w+b")
         if self.options.dry_run:
             if stdout is not None:
                 stdout.write(f"[dry-run] {launch.full_command}\n".encode("utf-8"))
                 stdout.close()
             if stderr is not None:
                 stderr.close()
+            if ssh_stderr is not None:
+                ssh_stderr.close()
             launch.lease.release()
             result = CommandResult(
                 runner=launch.runner.name,
@@ -831,7 +858,13 @@ class Runtime:
             process = subprocess.Popen(
                 launch.argv,
                 stdout=stdout if stdout is not None else subprocess.DEVNULL,
-                stderr=stderr if stderr is not None else subprocess.DEVNULL,
+                stderr=(
+                    stderr
+                    if stderr is not None
+                    else ssh_stderr
+                    if ssh_stderr is not None
+                    else subprocess.DEVNULL
+                ),
                 stdin=subprocess.DEVNULL if launch.runner.kind == "ssh" else None,
                 env=launch.env,
                 cwd=launch.cwd,
@@ -842,6 +875,8 @@ class Runtime:
                 stdout.close()
             if stderr is not None:
                 stderr.close()
+            if ssh_stderr is not None:
+                ssh_stderr.close()
             raise
         return RunningCommand(
             spec=pending.spec,
@@ -851,6 +886,7 @@ class Runtime:
             handle=pending.handle,
             stdout=stdout,
             stderr=stderr,
+            ssh_stderr=ssh_stderr,
             lease=launch.lease,
             started_at=time.time(),
             work_relpath=launch.work_relpath,
@@ -881,6 +917,7 @@ class Runtime:
             self.running.remove(running)
             self.runner_active[running.runner.name] -= 1
             running.lease.release()
+            ssh_stderr = self._read_and_close(running.ssh_stderr)
             if running.stdout is not None:
                 running.stdout.close()
             if running.stderr is not None:
@@ -897,7 +934,21 @@ class Runtime:
                 cores=tuple(running.lease.cores),
                 numa_node=running.lease.mem_node,
             )
-            if running.spec.check and returncode != 0:
+            if returncode != 0 and running.runner.kind == "ssh" and ssh_stderr:
+                self._report_ssh_transport_failure(
+                    runner=running.runner,
+                    returncode=returncode,
+                    work_dir=running.work_dir,
+                    diagnostic=ssh_stderr,
+                )
+                running.future.set_exception(
+                    SSHTransportFailure(
+                        work_dir=running.work_dir,
+                        returncode=returncode,
+                        diagnostic=ssh_stderr,
+                    )
+                )
+            elif running.spec.check and returncode != 0:
                 self._report_command_failure(
                     returncode=returncode,
                     work_dir=running.work_dir,
@@ -1163,6 +1214,18 @@ class Runtime:
                 running.stdout.close()
             if running.stderr is not None:
                 running.stderr.close()
+            if running.ssh_stderr is not None:
+                running.ssh_stderr.close()
+
+    @staticmethod
+    def _read_and_close(stream: BinaryIO | None) -> str:
+        if stream is None:
+            return ""
+        try:
+            stream.seek(0)
+            return stream.read().decode("utf-8", errors="replace").strip()
+        finally:
+            stream.close()
 
     @classmethod
     def _format_process_output(cls, stderr: bytes, stdout: bytes = b"") -> str:
@@ -1196,6 +1259,25 @@ class Runtime:
     ) -> None:
         print(
             f"command failed: {work_dir}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    @staticmethod
+    def _report_ssh_transport_failure(
+        *,
+        runner: _RuntimeRunnerSpec,
+        work_dir: str,
+        returncode: int,
+        diagnostic: str,
+    ) -> None:
+        print(
+            (
+                "ssh transport failed: "
+                f"runner={runner.name}; target={runner.target}; "
+                f"returncode={returncode}; work_dir={work_dir}; "
+                f"error={Runtime._one_line(diagnostic)}"
+            ),
             file=sys.stderr,
             flush=True,
         )
